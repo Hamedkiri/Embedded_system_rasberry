@@ -1,0 +1,28 @@
+# ===== Core (UI, vidéo, utilitaires) =====
+PySide6>=6.6
+opencv-python-headless>=4.9
+numpy>=1.26
+pillow>=10.2
+
+# ===== Export des résumés =====
+pandas>=2.2
+openpyxl>=3.1
+
+# ===== Backends d'inférence (dé-commente ceux que tu utilises) =====
+# --- PyTorch (.pt / .pth) ---
+torch>=2.3
+torchvision>=0.18
+
+# --- ONNX Runtime (.onnx) — CPU provider recommandé sur Raspberry Pi ---
+onnxruntime>=1.18
+
+# --- TensorFlow Lite (.tflite) ---
+# Remarque : les wheels varient selon l’architecture du Pi. Si l’installation échoue via pip,
+# télécharge le .whl spécifique (aarch64/armv7l) et installe-le manuellement.
+# Exemple markers (garde seulement la ligne qui correspond à ton Pi) :
+# tflite-runtime>=2.14 ; platform_machine == "aarch64"
+# tflite-runtime>=2.14 ; platform_machine == "armv7l"
+
+# ===== Optionnels =====
+# pykalman>=0.9.5   # si tu réactives un lissage Kalman des probabilités
+# opencv-python>=4.9  # si tu préfères la version non-headless (cv2.imshow)

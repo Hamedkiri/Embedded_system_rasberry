@@ -1,0 +1,19 @@
+{
+  "batch_size": 41,
+  "lr": 0.010783388907289613,
+  "truncate_layer": 10,
+  "tasks": {
+    "Weather Type": 8,
+    "Weather Intensity": 4,
+    "Visibility": 4,
+    "Sky Condition": 6,
+    "Precipitation Presence": 4,
+    "Precipitation Intensity": 4,
+    "Ground Condition": 7,
+    "Glare or Reflections": 2,
+    "Light Conditions": 5,
+    "Road Spray": 2,
+    "Water On Window": 3,
+    "Snow On Window": 3
+  }
+}

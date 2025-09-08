@@ -1,0 +1,5 @@
+
+/best_resnet_50
+/runs
+models/truncated_resnet50_attention/manifest.json
+*.pth

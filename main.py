@@ -15,7 +15,7 @@ import os
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
-import sys, json, time, glob, queue, datetime, shutil, ssl, smtplib
+import sys, json, time, glob, queue, datetime, shutil, ssl, smtplib, math
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 from collections import deque
@@ -23,13 +23,24 @@ from collections import deque
 import numpy as np
 import cv2
 
-# Pandas pour CSV/XLSX ; XLSX nécessite openpyxl
+# ─────────────────────────────────────────────────────────────
+#                 Config e-mail (Gmail unique)
+# ─────────────────────────────────────────────────────────────
+# REMPLIS ICI (ou via variables d'environnement) :
+DEFAULT_SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+DEFAULT_SMTP_PORT   = int(os.getenv("SMTP_PORT", "465"))   # SSL recommandé
+DEFAULT_EMAIL_USER  = os.getenv("SMTP_USER",  "your_account@gmail.com")
+DEFAULT_EMAIL_PASS  = os.getenv("SMTP_PASSWORD", "YOUR_APP_PASSWORD")  # mot de passe d'application Gmail
+DEFAULT_EMAIL_FROM  = os.getenv("SMTP_FROM", DEFAULT_EMAIL_USER)
+
+# ─────────────────────────────────────────────────────────────
+#                     Imports optionnels
+# ─────────────────────────────────────────────────────────────
 try:
     import pandas as pd
 except Exception:
     pd = None
 
-# Torch facultatif si vous n'utilisez pas PyTorch
 try:
     import torch
 except Exception:
@@ -41,12 +52,13 @@ except Exception:
         from numpy import ndarray
     torch = _DummyTorch()
 
-from PySide6.QtCore import Qt, QTimer, QObject, Signal, Slot, QThread
+from PySide6.QtCore import Qt, QTimer, QObject, Signal, Slot, QThread, QSize
 from PySide6.QtGui  import QImage, QPixmap, QFont, QAction
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QLineEdit,
     QFileDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QHBoxLayout, QVBoxLayout,
-    QGridLayout, QGroupBox, QMessageBox, QSizePolicy, QDialog, QFormLayout, QDialogButtonBox, QTextEdit
+    QGridLayout, QGroupBox, QMessageBox, QSizePolicy, QDialog, QFormLayout,
+    QDialogButtonBox, QTextEdit
 )
 
 # ─────────────────────────────────────────────────────────────
@@ -68,7 +80,6 @@ def preprocess_bgr_tanh(frame_bgr: np.ndarray, size: int) -> np.ndarray:
     img = (img / 127.5) - 1.0
     return img  # (H,W,3) float32
 
-
 # ─────────────────────────────────────────────────────────────
 #               Adapters / Registry (chargement modèle)
 # ─────────────────────────────────────────────────────────────
@@ -87,19 +98,16 @@ class BaseAdapter:
     def predict_bgr(self, frame_bgr: np.ndarray) -> Dict[str, "torch.Tensor"]:
         raise NotImplementedError
 
-
 class PyTorchMultiTaskAdapter(BaseAdapter):
     """Modèle PyTorch multi-tâches (dict logits par tâche)."""
     def __init__(self, weights_path: str, tasks: Dict[str, List[str]], device="cpu", input_size=224, extra: Optional[Dict[str, Any]]=None, preprocess: str="imagenet"):
         super().__init__(tasks, device, input_size, preprocess)
         self._jit = None
         self._model = None
-        # 1) torchscript direct
         try:
             self._jit = torch.jit.load(weights_path, map_location=device)
             self._jit.eval()
         except Exception:
-            # 2) fallback vers ton module ResNet50_truncated_module.py
             try:
                 from ResNet50_truncated_module import MultiHeadAttentionPerTaskModel, load_best_model
                 from torchvision import models
@@ -120,7 +128,7 @@ class PyTorchMultiTaskAdapter(BaseAdapter):
                     cls_hidden_dims=cls_hidden_dims,
                     cls_num_layers=cls_num_layers
                 )
-                # ⚠️ strict_backbone=False pour tolérer des ckpts hétérogènes
+                # tolérant sur le backbone
                 load_best_model(self._model, weights_path, strict_backbone=False, verbose=False)
                 self._model.eval()
             except Exception as e:
@@ -137,7 +145,6 @@ class PyTorchMultiTaskAdapter(BaseAdapter):
             else:
                 out = self._model(inp)
                 return out
-
 
 class TFLiteMultiHeadAdapter(BaseAdapter):
     def __init__(self, weights_path: str, tasks: Dict[str, List[str]], device="cpu", input_size=224, extra: Optional[Dict[str, Any]]=None, preprocess: str="imagenet"):
@@ -157,7 +164,6 @@ class TFLiteMultiHeadAdapter(BaseAdapter):
         nhwc = self._prep(frame_bgr)
         arr = nhwc[np.newaxis, ...].astype(np.float32)  # [1,H,W,3]
         inp = self.input_details[0]
-        # Si le modèle est quantisé uint8 → repasser en [0..255] RGB
         if inp["dtype"] == np.uint8:
             if self.preprocess == "imagenet":
                 rgb01 = np.clip((nhwc * _IMAGENET_STD + _IMAGENET_MEAN), 0, 1)
@@ -183,7 +189,6 @@ class TFLiteMultiHeadAdapter(BaseAdapter):
                 result[task] = torch.from_numpy(flat[:, off:off+n])
                 off += n
         return result
-
 
 class ONNXMultiHeadAdapter(BaseAdapter):
     def __init__(self, weights_path: str, tasks: Dict[str, List[str]], device="cpu", input_size=224, extra: Optional[Dict[str, Any]]=None, preprocess: str="imagenet"):
@@ -215,7 +220,6 @@ class ONNXMultiHeadAdapter(BaseAdapter):
                 result[task] = torch.from_numpy(flat[:, off:off+n])
                 off += n
         return result
-
 
 class PatchGANAdapter(BaseAdapter):
     """
@@ -250,13 +254,12 @@ class PatchGANAdapter(BaseAdapter):
             out = self.model(x)  # dict{task: logits}
         return out
 
-
 class ModelRegistry:
     _MAP = {
         "pytorch":  PyTorchMultiTaskAdapter,
         "tflite":   TFLiteMultiHeadAdapter,
         "onnx":     ONNXMultiHeadAdapter,
-        "patchgan": PatchGANAdapter,   # clé interne
+        "patchgan": PatchGANAdapter,
     }
 
     @staticmethod
@@ -274,7 +277,6 @@ class ModelRegistry:
     def _looks_like_patchgan(man: Dict[str, Any], path_hint: str) -> bool:
         txt = (json.dumps(man, ensure_ascii=False) + " " + path_hint).lower()
         if "patchgan" in txt: return True
-        # indices fréquents PatchGAN
         for k in ("patch_size", "attn_tau", "attn_use_se", "ndf", "discriminator"):
             if k in man or k in man.get("extra", {}):
                 return True
@@ -282,23 +284,13 @@ class ModelRegistry:
 
     @staticmethod
     def _read_config(model_path: str) -> Dict[str, Any]:
-        """
-        Retourne un cfg standardisé:
-          { type, input_size, tasks, extra, adapter? }
-        - Regarde d'abord config.json voisin
-        - Puis manifest.json voisin (et peut forcer adapter='patchgan')
-        """
         p = Path(model_path); base = p.parent
-
-        # 1) config.json voisin
         cfg_path = base / "config.json"
         if cfg_path.exists():
             try:
                 return json.loads(cfg_path.read_text(encoding="utf-8"))
             except Exception:
                 pass
-
-        # 2) manifest.json voisin
         mf = base / "manifest.json"
         if mf.exists():
             try:
@@ -311,14 +303,11 @@ class ModelRegistry:
                 }
                 if man.get("adapter", "").lower() == "patchgan" or ModelRegistry._looks_like_patchgan(man, str(p)):
                     cfg["adapter"] = "patchgan"
-                # Si tasks = dict{task:count} → fabriquer labels
                 if cfg["tasks"] and isinstance(list(cfg["tasks"].values())[0], int):
                     cfg["tasks"] = ModelRegistry._labels_from_tasks(cfg["tasks"])
                 return cfg
             except Exception:
                 pass
-
-        # 3) défaut
         return {}
 
     @staticmethod
@@ -336,11 +325,9 @@ class ModelRegistry:
         if extra: merged_extra.update(extra)
         preprocess = merged_extra.get("preprocess", "imagenet")
 
-        # PATCHGAN : si détecté → utiliser l'adapter dédié
         if adapter == "patchgan":
             return PatchGANAdapter(model_path, device=device)
 
-        # Sinon, adapter standard
         if mtype not in cls._MAP:
             raise ValueError(f"Type inconnu pour {model_path}. Ajoutez 'type' dans config.json (pytorch|tflite|onnx).")
 
@@ -356,13 +343,11 @@ class ModelRegistry:
             preprocess=preprocess,
         )
 
-
 # ─────────────────────────────────────────────────────────────
 #                 Thread léger d’inférence (non bloquant)
 # ─────────────────────────────────────────────────────────────
 class InferWorker(QObject):
     resultReady = Signal(np.ndarray, dict, float)  # frame_bgr, outputs, elapsed_sec
-
     def __init__(self, infer_adapter: BaseAdapter, prob_threshold: float):
         super().__init__()
         self.infer = infer_adapter
@@ -393,43 +378,36 @@ class InferWorker(QObject):
     def stop(self):
         self._running = False
 
-
 # ─────────────────────────────────────────────────────────────
-#                    Dialogue e-mail (SMTP)
+#                    Dialogue e-mail (SMTP) simplifié
 # ─────────────────────────────────────────────────────────────
 class EmailDialog(QDialog):
+    """
+    Utilise un unique compte Gmail préconfiguré (voir constantes).
+    L'utilisateur ne renseigne que : Destinataires, Sujet, Message, + pièces jointes.
+    """
     def __init__(self, parent=None, default_attachments: Optional[List[Path]]=None):
         super().__init__(parent)
         self.setWindowTitle("Envoyer par e-mail")
-        self.resize(520, 420)
+        self.resize(520, 360)
         self.attachments: List[Path] = list(default_attachments or [])
 
-        self.serverEdit = QLineEdit("smtp.gmail.com")
-        self.portEdit   = QLineEdit("465")  # SSL
-        self.useTlsChk  = QCheckBox("Utiliser STARTTLS (au lieu de SSL)")
-        self.userEdit   = QLineEdit()
-        self.passEdit   = QLineEdit(); self.passEdit.setEchoMode(QLineEdit.Password)
-        self.fromEdit   = QLineEdit()
-        self.toEdit     = QLineEdit()
-        self.subjEdit   = QLineEdit("Fichiers de détection")
-        self.bodyEdit   = QTextEdit("Veuillez trouver ci-joint les fichiers de détection.")
+        # Champs visibles
+        self.toEdit   = QLineEdit()
+        self.subjEdit = QLineEdit("Fichiers de détection")
+        self.bodyEdit = QTextEdit("Veuillez trouver ci-joint les fichiers de détection.")
 
-        self.attLabel   = QLabel(self._att_text())
+        self.attLabel = QLabel(self._att_text())
         addBtn = QPushButton("Ajouter pièces jointes…"); addBtn.clicked.connect(self._add_attachments)
-        clearBtn = QPushButton("Vider la liste"); clearBtn.clicked.connect(self._clear_attachments)
+        clearBtn = QPushButton("Vider la liste");        clearBtn.clicked.connect(self._clear_attachments)
 
         form = QFormLayout()
-        form.addRow("Serveur SMTP :", self.serverEdit)
-        form.addRow("Port :", self.portEdit)
-        form.addRow("", self.useTlsChk)
-        form.addRow("Utilisateur :", self.userEdit)
-        form.addRow("Mot de passe :", self.passEdit)
-        form.addRow("From :", self.fromEdit)
-        form.addRow("To (séparés par ,) :", self.toEdit)
+        form.addRow("À (séparés par ,) :", self.toEdit)
         form.addRow("Sujet :", self.subjEdit)
         form.addRow("Message :", self.bodyEdit)
 
         attRow = QHBoxLayout(); attRow.addWidget(addBtn); attRow.addWidget(clearBtn); attRow.addStretch()
+
         v = QVBoxLayout(self)
         v.addLayout(form)
         v.addWidget(QLabel("Pièces jointes :"))
@@ -458,19 +436,20 @@ class EmailDialog(QDialog):
         self.attLabel.setText(self._att_text())
 
     def send_email(self) -> Tuple[bool, str]:
+        """Envoie via SMTP SSL avec les identifiants constants/ENV."""
         try:
-            server = self.serverEdit.text().strip()
-            port   = int(self.portEdit.text().strip() or "465")
-            use_tls = self.useTlsChk.isChecked()
-            user  = self.userEdit.text().strip()
-            pwd   = self.passEdit.text()
-            sender = self.fromEdit.text().strip() or user
+            server = DEFAULT_SMTP_SERVER
+            port   = DEFAULT_SMTP_PORT
+            user   = DEFAULT_EMAIL_USER
+            pwd    = DEFAULT_EMAIL_PASS
+            sender = DEFAULT_EMAIL_FROM
+
             to_list = [t.strip() for t in self.toEdit.text().split(",") if t.strip()]
             subject = self.subjEdit.text().strip()
             body    = self.bodyEdit.toPlainText()
 
-            if not (server and port and sender and to_list):
-                return False, "Champs requis manquants (serveur/port/from/to)."
+            if not (server and port and sender and to_list and user and pwd):
+                return False, "Configuration e-mail incomplète (vérifiez SMTP_USER / SMTP_PASSWORD)."
 
             from email.mime.multipart import MIMEMultipart
             from email.mime.text import MIMEText
@@ -491,20 +470,15 @@ class EmailDialog(QDialog):
                 part.add_header("Content-Disposition", f'attachment; filename="{att.name}"')
                 msg.attach(part)
 
-            if use_tls:
-                s = smtplib.SMTP(server, port, timeout=30); s.ehlo()
-                s.starttls(context=ssl.create_default_context())
-            else:
-                s = smtplib.SMTP_SSL(server, port, timeout=30); s.ehlo()
-
-            if user and pwd:
-                s.login(user, pwd)
+            # Connexion SSL
+            s = smtplib.SMTP_SSL(server, port, timeout=30)
+            s.ehlo()
+            s.login(user, pwd)
             s.sendmail(sender, to_list, msg.as_string())
             s.quit()
             return True, "E-mail envoyé."
         except Exception as e:
             return False, f"Échec envoi : {e}"
-
 
 # ─────────────────────────────────────────────────────────────
 #                    Fenêtre principale (Qt)
@@ -526,6 +500,7 @@ class MainWindow(QMainWindow):
 
         self.current_adapter: Optional[BaseAdapter] = None
         self.tasks: Dict[str, List[str]] = {}
+        self.tasks_order: List[str] = []  # ← ordre du manifest
         self.device = "cpu"
 
         # Session / enregistrement
@@ -681,7 +656,7 @@ class MainWindow(QMainWindow):
         """Scan récursif de models/** pour *.pt|*.pth|*.tflite|*.onnx (on cache manifest.json)."""
         self.modelCombo.clear()
         models_dir = Path("models").resolve(); models_dir.mkdir(exist_ok=True)
-        patterns = ("**/*.pt", "**/*.pth", "**/*.tflite", "**/*.onnx")  # pas de manifest.json ici
+        patterns = ("**/*.pt", "**/*.pth", "**/*.tflite", "**/*.onnx")
         files: List[str] = []
         for pat in patterns:
             files += glob.glob(str(models_dir / pat), recursive=True)
@@ -739,11 +714,14 @@ class MainWindow(QMainWindow):
                 device=self.device,
                 extra=None
             )
-            # Si c'est PatchGANAdapter, actualiser tasks
+            # Si PatchGANAdapter, récupérer les tâches depuis le manifest (ordre respecté)
             if isinstance(self.current_adapter, PatchGANAdapter):
                 self.tasks = self.current_adapter.tasks
         except Exception as e:
             QMessageBox.critical(self, "Chargement modèle", str(e)); return
+
+        # Mémorise l'ordre EXACT du manifest/classes
+        self.tasks_order = list(self.tasks.keys())
 
         self.deviceLabel.setText(f"Device: {'GPU' if self.device=='cuda' else 'CPU'}")
 
@@ -766,7 +744,7 @@ class MainWindow(QMainWindow):
         if not self.sessionEdit.text().strip(): self.sessionEdit.setText(self._build_default_session_name(model_path))
         self.summary_rows.clear()
         self.session_started_at = datetime.datetime.now()
-        self.meta = {"model_path": model_path, "tasks": list(self.tasks.keys()), "start_time": self.session_started_at.isoformat(timespec="seconds")}
+        self.meta = {"model_path": model_path, "tasks": self.tasks_order.copy(), "start_time": self.session_started_at.isoformat(timespec="seconds")}
         self.lat_ema_s = None; self.fps_hist.clear()
 
         self.target_fps = self.fpsSpin.value()
@@ -808,18 +786,22 @@ class MainWindow(QMainWindow):
 
     @Slot(np.ndarray, dict, float)
     def _on_infer_result(self, frame_bgr: np.ndarray, outputs: dict, elapsed: float):
-        # Post-traitement : softmax + libellés + overlay
-        lines = []
+        # Post-traitement : softmax + libellés + overlay (ordre manifest)
+        items = []   # [(task, label, score)]
         per_task = {}
-        for task, logits in outputs.items():
+
+        for task in self.tasks_order:
+            if task not in outputs:
+                continue
+            logits = outputs[task]
             logits_np = logits.detach().cpu().numpy() if hasattr(logits, "detach") else np.asarray(logits)
             vec = logits_np[0] if logits_np.ndim > 1 else logits_np
             probs = softmax_np(vec)
             idx = int(np.argmax(probs))
             score = float(probs[idx])
             labels = self.tasks.get(task, [f"{task}_{i}" for i in range(len(probs))])
-            label = labels[idx] if score >= self.threshSpin.value() and idx < len(labels) else "Unknown"
-            lines.append(f"{task}: {label} ({score:.2f})")
+            label = labels[idx] if (idx < len(labels) and score >= self.threshSpin.value()) else "Unknown"
+            items.append((task, label, score))
             per_task[task] = {"label": label, "score": score}
 
         # Vitesse (EMA + FPS)
@@ -827,8 +809,11 @@ class MainWindow(QMainWindow):
         inst_fps = 1.0 / max(elapsed, 1e-6); self.fps_hist.append(inst_fps)
         avg_fps = sum(self.fps_hist)/len(self.fps_hist)
 
-        bottom_text = f"{self.lat_ema_s*1000:.1f} ms  |  {avg_fps:.1f} FPS" if self.speedCheck.isChecked() else None
-        disp = draw_overlay(frame_bgr, lines, bottom_right_text=bottom_text)
+        disp = frame_bgr.copy()
+        # Panneau compact (2 colonnes si >6 lignes), en haut-droite
+        disp = draw_predictions_panel(disp, items, location="tr")
+        if self.speedCheck.isChecked():
+            disp = draw_bottom_right(disp, f"{self.lat_ema_s*1000:.1f} ms  |  {avg_fps:.1f} FPS", alpha=0.55)
 
         # Enregistrement vidéo
         if self.recording_video:
@@ -975,7 +960,6 @@ class MainWindow(QMainWindow):
                     for r in self.summary_rows:
                         f.write("\t".join(str(r.get(k, "")) for k in keys) + "\n")
 
-
 # ─────────────────────────────────────────────────────────────
 #                      Utils overlay & I/O
 # ─────────────────────────────────────────────────────────────
@@ -986,47 +970,134 @@ def softmax_np(x):
     s = e.sum()
     return e / (s if s > 0 else 1.0)
 
-def draw_overlay(frame_bgr: np.ndarray, lines: List[str], bottom_right_text: Optional[str]=None) -> np.ndarray:
-    disp = frame_bgr.copy()
+def _auto_font_scale_for_h(h: int, base: float = 0.50) -> float:
+    """
+    Scale police compact, adaptative à la hauteur vidéo.
+    ~0.55 @720p ; ~0.65 @1080p ; borne [0.45, 0.8]
+    """
+    sc = base * math.sqrt(max(h, 240) / 720.0) + 0.05
+    return float(max(0.45, min(0.80, sc)))
+
+def draw_predictions_panel(img: np.ndarray, items: List[Tuple[str, str, float]], location: str = "tr") -> np.ndarray:
+    """
+    Panneau compact multi-colonnes pour les prédictions.
+    - 'items' = [(task, label, score)]
+    - location: 'tr' (top-right) | 'tl' | 'br' | 'bl'
+    Règles:
+      * 1 colonne si <= 6 lignes, sinon 2 colonnes équilibrées
+      * fond sombre semi-transparent, texte clair, label en vert
+    """
+    if not items:
+        return img
+
+    out = img.copy()
+    h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale, thick = 0.7, 2
-    pad_x, pad_y = 12, 10
-    y0, y_step = 30, 28
+    scale = _auto_font_scale_for_h(h)
+    thick = 1
 
-    longest = max(lines + ["Prévision"], key=len)
-    (tw, th), _ = cv2.getTextSize(longest, font, scale, thick)
-    box_left, box_top = 0, 0
-    box_right = int(tw + 2 * pad_x)
-    box_bottom = int(y0 + (len(lines)-1) * y_step + pad_y)
+    # Construit les lignes "Task: Label (0.95)"
+    lines = [f"{t}: {lbl} ({s:.2f})" for (t, lbl, s) in items]
 
-    overlay = disp.copy()
-    cv2.rectangle(overlay, (box_left, box_top), (box_right, box_bottom), (255,255,255), -1)
-    cv2.addWeighted(overlay, 0.35, disp, 0.65, 0, disp)
+    # Choix du nb de colonnes
+    n = len(lines)
+    cols = 1 if n <= 6 else 2
+    rows = int(math.ceil(n / cols))
 
-    for i, line in enumerate(lines):
-        y = y0 + i * y_step
-        cv2.putText(disp, line, (pad_x, y), font, scale, (0,255,0), thick, cv2.LINE_AA)
+    # Taille texte par ligne (pour largeur colonnes)
+    pad_x, pad_y = 10, 8
+    inter_col = 24  # espace entre colonnes
 
-    if bottom_right_text:
-        disp = draw_bottom_right(disp, bottom_right_text, alpha=0.6)
+    # répartir par colonnes
+    cols_text: List[List[str]] = []
+    for c in range(cols):
+        start = c * rows
+        cols_text.append(lines[start:start+rows])
 
-    return disp
+    # Largeur par colonne
+    col_widths = []
+    text_sizes = []  # tailles [(w,h)] pour la 1re colonne (liste), puis 2e…
+    for c in range(cols):
+        c_sizes = []
+        m = 0
+        for line in cols_text[c]:
+            (tw, th), _ = cv2.getTextSize(line, font, scale, thick)
+            c_sizes.append((tw, th))
+            m = max(m, tw)
+        col_widths.append(m)
+        text_sizes.append(c_sizes)
+
+    panel_w = sum(col_widths) + pad_x * 2 + (cols - 1) * inter_col
+    # hauteur : nombre de lignes max * (th + line_gap)
+    line_h = (text_sizes[0][0][1] if text_sizes[0] else int(18 * scale)) + 6
+    panel_h = rows * line_h + pad_y * 2
+
+    # Position panneau
+    margin = 10
+    if location == "tr":
+        x1 = w - panel_w - margin
+        y1 = margin
+    elif location == "tl":
+        x1 = margin
+        y1 = margin
+    elif location == "br":
+        x1 = w - panel_w - margin
+        y1 = h - panel_h - margin
+    else:  # "bl"
+        x1 = margin
+        y1 = h - panel_h - margin
+
+    x2 = x1 + int(panel_w)
+    y2 = y1 + int(panel_h)
+
+    # Fond sombre semi-transparent
+    overlay = out.copy()
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.45, out, 0.55, 0, out)
+
+    # Dessin du texte (task en gris clair, label en vert)
+    col_x = x1 + pad_x
+    green = (60, 200, 60)
+    white = (240, 240, 240)
+    grey  = (190, 190, 190)
+
+    idx = 0
+    for c in range(cols):
+        col_lines = cols_text[c]
+        y = y1 + pad_y + int(text_sizes[c][0][1] if text_sizes[c] else 16)
+        for line in col_lines:
+            # séparation "Task: Label (p)"
+            if ": " in line:
+                task_txt, rest = line.split(": ", 1)
+            else:
+                task_txt, rest = line, ""
+            # task
+            cv2.putText(out, task_txt + ":", (col_x, y), font, scale, grey, 1, cv2.LINE_AA)
+            # label + score
+            (tw_task, _), _ = cv2.getTextSize(task_txt + ":", font, scale, 1)
+            cv2.putText(out, " " + rest, (col_x + tw_task, y), font, scale, green, 1, cv2.LINE_AA)
+            y += line_h
+            idx += 1
+        col_x += col_widths[c] + inter_col
+
+    return out
 
 def draw_bottom_right(img: np.ndarray, text: str, alpha: float=0.6) -> np.ndarray:
     out = img.copy()
     h, w = out.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale, thick = 0.6, 2
+    scale = _auto_font_scale_for_h(h, base=0.45)
+    thick = 1
     (tw, th), _ = cv2.getTextSize(text, font, scale, thick)
     pad = 10
     x2, y2 = w - 10, h - 10
     x1, y1 = x2 - (tw + 2*pad), y2 - (th + 2*pad)
 
     overlay = out.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (255,255,255), -1)
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0,0,0), -1)
     cv2.addWeighted(overlay, alpha, out, 1-alpha, 0, out)
-    cv2.putText(out, text, (x1 + pad, y2 - pad - 2), font, scale, (0,0,0), 2, cv2.LINE_AA)
-    cv2.putText(out, text, (x1 + pad, y2 - pad - 2), font, scale, (34,139,34), 1, cv2.LINE_AA)
+    cv2.putText(out, text, (x1 + pad, y2 - pad - 2), font, scale, (240,240,240), 2, cv2.LINE_AA)
+    cv2.putText(out, text, (x1 + pad, y2 - pad - 2), font, scale, (60,200,60), 1, cv2.LINE_AA)
     return out
 
 def write_csv_fallback(path: Path, rows: List[Dict[str, Any]]):
@@ -1038,7 +1109,6 @@ def write_csv_fallback(path: Path, rows: List[Dict[str, Any]]):
         for r in rows:
             vals = [str(r.get(k, "")) for k in keys]
             f.write(",".join(vals) + "\n")
-
 
 # ─────────────────────────────────────────────────────────────
 #                           Main

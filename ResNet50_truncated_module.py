@@ -1,19 +1,24 @@
-#ResNet50_truncated_module.py
+# ResNet50_truncated_module.py — sélection/élagage de tâches + chargement filtré
 import math
 import re
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Iterable
 
 import torch
 import torch.nn as nn
 
 
-def load_best_model(model, filepath, strict_backbone: bool = True, verbose: bool = True):
+def load_best_model(model,
+                    filepath,
+                    strict_backbone: bool = True,
+                    verbose: bool = True,
+                    keep_tasks: Optional[Iterable[str]] = None):
     """
-    Chargement partiel robuste avec remap:
+    Chargement partiel robuste avec remap + filtrage par tâches:
       - supporte 'module.' ; 'backbone.'/ 'truncated_encoder.' / ResNet brut
       - remap des classifieurs: 'classifiers.classifier_X.weight/bias'
         → dernière couche linéaire du MLP: 'classifiers.classifier_X.{last_idx}.weight/bias'
       - si shapes diffèrent, copie partielle (jusqu'à min sur chaque axe)
+      - keep_tasks: liste des tâches à charger (les autres têtes sont ignorées)
     """
     ckpt = torch.load(filepath, map_location=model.device)
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
@@ -41,6 +46,7 @@ def load_best_model(model, filepath, strict_backbone: bool = True, verbose: bool
 
     # 2) remap des features (backbone/truncated_encoder/ResNet brut)
     if feat_prefix_ckpt is None:
+        # ckpt au format ResNet brut (conv1, bn1, layer1..)
         root2idx = {
             "conv1": 0, "bn1": 1, "relu": 2, "maxpool": 3,
             "layer1": 4, "layer2": 5, "layer3": 6, "layer4": 7,
@@ -75,12 +81,11 @@ def load_best_model(model, filepath, strict_backbone: bool = True, verbose: bool
     for cls_name, mod in model.classifiers.items():
         last_idx = None
         if isinstance(mod, nn.Sequential):
-            # récupère l'index de la dernière couche Linear
             for i, m in enumerate(mod):
                 if isinstance(m, nn.Linear):
                     last_idx = i
         elif isinstance(mod, nn.Linear):
-            last_idx = None  # pas d'indexation
+            last_idx = None
         cls_last_linear_idx[cls_name] = last_idx
 
     converted = dict(remapped)  # copy
@@ -90,9 +95,7 @@ def load_best_model(model, filepath, strict_backbone: bool = True, verbose: bool
         if m:
             cls_name, wb = m.group(1), m.group(2)  # ex: classifier_Weather_Type, weight
             last_idx = cls_last_linear_idx.get(cls_name, None)
-            # construit la clé cible
             if last_idx is None:
-                # tête Linear pure dans le modèle courant
                 new_k = f"classifiers.{cls_name}.{wb}"
             else:
                 new_k = f"classifiers.{cls_name}.{last_idx}.{wb}"
@@ -102,11 +105,32 @@ def load_best_model(model, filepath, strict_backbone: bool = True, verbose: bool
 
     remapped = converted
 
-    # 4) filtrage/redimensionnement éventuel
+    # 3bis) FILTRAGE par tâches (attentions.* et classifiers.*) si keep_tasks fourni
+    if keep_tasks is not None:
+        keep_set = { _task_to_key(t) for t in keep_tasks }  # noms avec underscores
+        filtered = {}
+        pat_attn = re.compile(r'^attentions\.attention_([^\.]+)\.')
+        pat_cls  = re.compile(r'^classifiers\.classifier_([^\.]+)\.')
+        for k, v in remapped.items():
+            if k.startswith("attentions.attention_"):
+                m = pat_attn.match(k)
+                if m and m.group(1) in keep_set:
+                    filtered[k] = v
+                else:
+                    # on drop
+                    pass
+            elif k.startswith("classifiers.classifier_"):
+                m = pat_cls.match(k)
+                if m and m.group(1) in keep_set:
+                    filtered[k] = v
+            else:
+                filtered[k] = v  # backbone/truncated_encoder/others
+        remapped = filtered
+
+    # 4) filtrage/redimensionnement éventuel (copie partielle sur mismatch)
     new_state, to_load = model.state_dict(), {}
     for k, v in remapped.items():
         if k not in new_state:
-            # garder le log VERBOSE pour comprendre les skips
             if verbose and (k.startswith("classifiers.") or k.startswith("attentions.")):
                 print(f"[skip] {k} absent du modèle courant")
             continue
@@ -127,10 +151,15 @@ def load_best_model(model, filepath, strict_backbone: bool = True, verbose: bool
         if missing:
             raise RuntimeError(f"Backbone keys manquantes ({len(missing)}). Ex: {missing[:10]}")
 
-    msg = model.load_state_dict(to_load, strict=False)
+    msg = model.load_state_dict(to_load, strict=False)  # strict False pour tolérer l'élagage
     if verbose:
         print(f"✔ {len(to_load)} tenseurs chargés (missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)})")
     model.to(model.device)
+
+
+def _task_to_key(task: str) -> str:
+    """'Weather Type' → 'Weather_Type' (clé utilisée dans les ModuleDicts)."""
+    return task.replace(' ', '_')
 
 
 # --- Nouvelle attention : query par tâche sur tokens spatiaux [B,HW,C] ---
@@ -158,6 +187,10 @@ class MultiHeadAttentionPerTaskModel(nn.Module):
     - use_attention=True  : tokens [B,HW,C] -> TaskAttentionHead -> MLP par tâche
     - use_attention=False : ablation, GAP [B,C] -> MLP par tâche
     Supporte le retour des embeddings (par tâche et/ou partagés) pour t-SNE.
+
+    Nouveautés:
+      - forward(..., only=[...]) : n'inférer que sur un sous-ensemble de tâches
+      - prune_to_tasks([...])    : supprimer définitivement les têtes non gardées
     """
     def __init__(self,
                  base_encoder: nn.Module,
@@ -192,7 +225,7 @@ class MultiHeadAttentionPerTaskModel(nn.Module):
         cls_hidden_dims = cls_hidden_dims or []
 
         for task, n_cls in self.tasks.items():
-            key = task.replace(' ', '_')
+            key = _task_to_key(task)
             if self.use_attention:
                 self.attentions[f"attention_{key}"] = TaskAttentionHead(C, attn_token_dim)
             # MLP: C -> hidden_dims[:cls_num_layers] -> n_cls
@@ -204,16 +237,44 @@ class MultiHeadAttentionPerTaskModel(nn.Module):
             layers.append(nn.Linear(dims[-1], n_cls))
             self.classifiers[f"classifier_{key}"] = nn.Sequential(*layers)
 
+    # ---- Gestion des sous-ensembles de tâches ----
+    def _tasks_to_run(self, only: Optional[Iterable[str]]) -> List[str]:
+        if only is None:
+            return list(self.tasks.keys())
+        # on garde l'ordre fourni par 'only' mais on filtre
+        avail = set(self.tasks.keys())
+        return [t for t in only if t in avail]
+
+    def prune_to_tasks(self, keep_tasks: Iterable[str]):
+        """
+        Supprime définitivement les têtes non gardées et met à jour self.tasks.
+        """
+        keep = set(keep_tasks or [])
+        # supprimer des ModuleDicts
+        for task in list(self.tasks.keys()):
+            if task not in keep:
+                key = _task_to_key(task)
+                cls_key = f"classifier_{key}"
+                att_key = f"attention_{key}"
+                if cls_key in self.classifiers:
+                    del self.classifiers[cls_key]
+                if att_key in self.attentions:
+                    del self.attentions[att_key]
+                del self.tasks[task]
+
     def forward(self,
                 x: torch.Tensor,
                 *,
                 return_task_embeddings: bool = False,
-                return_shared_embedding: bool = False):
+                return_shared_embedding: bool = False,
+                only: Optional[List[str]] = None):
         """
         Retourne:
           - logits_dict: dict{task -> logits}
           - (+) task_embeds: dict{task -> [B,C]} si return_task_embeddings
           - (+) shared: Tensor [B,C] si return_shared_embedding
+        Paramètre:
+          - only: liste des tâches à inférer (sous-ensemble)
         """
         x = x.to(self.device)
         feat = self.truncated_encoder(x)                # [B,C,H,W]
@@ -223,20 +284,27 @@ class MultiHeadAttentionPerTaskModel(nn.Module):
         shared = feat.mean(dim=(2, 3))                  # [B,C]
 
         logits_dict, task_embeds = {}, {}
+        tasks_to_run = self._tasks_to_run(only)
 
         if self.use_attention:
             tokens = feat.flatten(2).transpose(1, 2)    # [B,HW,C]
-            for attn_name, attn in self.attentions.items():
-                task = attn_name.replace("attention_", "").replace('_', ' ')
-                cls_name = f"classifier_{task.replace(' ', '_')}"
+            for task in tasks_to_run:
+                key = _task_to_key(task)
+                attn = self.attentions.get(f"attention_{key}", None)
+                cls  = self.classifiers.get(f"classifier_{key}", None)
+                if attn is None or cls is None:
+                    continue
                 h = attn(tokens)                        # [B,C] embedding par tâche
-                logits_dict[task] = self.classifiers[cls_name](h)
+                logits_dict[task] = cls(h)
                 task_embeds[task] = h
         else:
             # Ablation: pas d'attention, GAP → MLP par tâche
-            for task in self.tasks:
-                cls_name = f"classifier_{task.replace(' ', '_')}"
-                logits_dict[task] = self.classifiers[cls_name](shared)
+            for task in tasks_to_run:
+                key = _task_to_key(task)
+                cls = self.classifiers.get(f"classifier_{key}", None)
+                if cls is None:
+                    continue
+                logits_dict[task] = cls(shared)
                 task_embeds[task] = shared
 
         if return_task_embeddings and return_shared_embedding:
@@ -256,6 +324,5 @@ class TaskSpecificModel(nn.Module):
         self.task_name = task_name
 
     def forward(self, x):
-        outputs = self.model(x)
+        outputs = self.model(x, only=[self.task_name])
         return outputs[self.task_name]
-

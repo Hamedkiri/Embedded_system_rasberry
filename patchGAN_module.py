@@ -1,5 +1,4 @@
-#loader_patchgan_from_manifest.py
-
+# patchGAN_module.py — version avec sélection/élagage de tâches
 import argparse
 
 from torch.utils.data import Subset
@@ -15,6 +14,8 @@ import functools
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, List, Dict, Iterable
+
 # -------------------------------------------------------------------
 # Le dictionnaire de colormaps OpenCV pour Grad-CAM
 # -------------------------------------------------------------------
@@ -28,16 +29,11 @@ colormap_dict = {
     'turbo': cv2.COLORMAP_TURBO,
     'viridis': cv2.COLORMAP_VIRIDIS,
     'magma': cv2.COLORMAP_MAGMA,
-    # Vous pouvez en ajouter d'autres si nécessaire
 }
 
 # -------------------------------------------------------------------
 # 1) DATASET MULTI-TÂCHES
-#    (basé sur vos JSON data_json / classes_json, comme dans vos scripts)
 # -------------------------------------------------------------------
-# =============================================================================
-# Dataset multi-tâches
-# =============================================================================
 class MultiTaskDataset(torch.utils.data.Dataset):
     def __init__(self, data_json, classes_json, transform=None, search_folder=None, find_images_by_sub_folder=None):
         with open(data_json, 'r') as f:
@@ -63,8 +59,6 @@ class MultiTaskDataset(torch.utils.data.Dataset):
                 if self.search_folder:
                     image_identifier = os.path.join(self.search_folder, os.path.basename(orig_path))
                 elif self.find_images_by_sub_folder:
-                    # Extraire le sous-dossier juste avant le nom de l'image dans le chemin d'origine
-                    # ex: .../training_13052025/sun/2025xxx.jpg -> subfolder = 'sun'
                     subfolder = os.path.basename(os.path.dirname(orig_path))
                     image_identifier = os.path.join(
                         self.find_images_by_sub_folder,
@@ -98,14 +92,9 @@ class MultiTaskDataset(torch.utils.data.Dataset):
             img = self.transform(img)
         return img, labels
 
-
-
 # -------------------------------------------------------------------
-# 2) MODULES D'ATTENTION & TÊTES MULTI-TÂCHES (PatchGAN) — VERSION ADAPTÉE
+# 2) MODULES D'ATTENTION & TÊTES MULTI-TÂCHES (PatchGAN)
 # -------------------------------------------------------------------
-
-
-# ---------- Channel Attention (léger) ----------
 class SE(nn.Module):
     def __init__(self, c: int, r: int = 16):
         super().__init__()
@@ -119,7 +108,6 @@ class SE(nn.Module):
         wgt = self.mlp(x.mean((2, 3))).view(n, c, 1, 1)
         return x * wgt
 
-# ---------- Head avec attention utile + ablation ----------
 class TaskHeadImproved(nn.Module):
     """
     - (option) SE (channel attention)
@@ -168,22 +156,25 @@ class TaskHeadImproved(nn.Module):
         return logits, A
 
 # -------------------------------------------------------------------
-# 3) PATCHGAN TRONQUÉ MULTI-TÂCHES — VERSION ADAPTÉE (compat arrière)
+# 3) PATCHGAN TRONQUÉ MULTI-TÂCHES — compat + sélection 'only'
 # -------------------------------------------------------------------
 class MultiTaskPatchGAN(nn.Module):
     """
     - Tronc PatchGAN (InstanceNorm affine=True recommandé pour style)
     - Une tête par tâche avec attention améliorée
     - Compat arrière:
-        * model(x) -> {task: logits Tensor} (comme avant)
+        * model(x) -> {task: logits Tensor}
         * model(x, return_full=True) -> {task: {'logits': Tensor, 'attn': Tensor}}
-        * return_embeddings/return_task_embeddings disponibles (comme avant)
+        * return_embeddings/return_task_embeddings disponibles
+    - Nouveautés:
+        * forward(..., only=[...]) : n'inférer que les tâches listées
+        * prune_to_tasks([...])    : supprimer définitivement les têtes non sélectionnées
     """
-    def __init__(self, tasks_dict, input_nc=3, ndf=64, norm="instance", patch_size=70, device='cpu',
+    def __init__(self, tasks_dict: Dict[str, int], input_nc=3, ndf=64, norm="instance", patch_size=70, device='cpu',
                  attn_tau=0.7, attn_use_se=True, attn_softmax_spatial=True, ablate_attention=False):
         super().__init__()
         self.device = device
-        self.tasks_dict = tasks_dict
+        self.tasks_dict = dict(tasks_dict)  # copie
         self.ablate_attention = ablate_attention
 
         if norm == 'instance':
@@ -219,7 +210,7 @@ class MultiTaskPatchGAN(nn.Module):
         self.trunk = nn.Sequential(*layers).to(self.device)
 
         self.task_heads = nn.ModuleDict()
-        for task_name, nb_cls in tasks_dict.items():
+        for task_name, nb_cls in self.tasks_dict.items():
             self.task_heads[task_name] = TaskHeadImproved(
                 in_channels=final_c, out_channels=nb_cls,
                 use_se=attn_use_se,
@@ -228,6 +219,23 @@ class MultiTaskPatchGAN(nn.Module):
                 ablate_attention=ablate_attention
             ).to(self.device)
 
+    def _tasks_to_run(self, only: Optional[Iterable[str]]) -> List[str]:
+        if only is None:
+            return list(self.task_heads.keys())
+        return [t for t in only if t in self.task_heads]
+
+    def prune_to_tasks(self, keep_tasks: Iterable[str]):
+        """
+        Supprime définitivement les têtes non gardées et met à jour tasks_dict.
+        Utile si l'on veut un modèle "allégé" (moins de params / overhead).
+        """
+        keep = set(keep_tasks or [])
+        for t in list(self.task_heads.keys()):
+            if t not in keep:
+                del self.task_heads[t]
+                if t in self.tasks_dict:
+                    del self.tasks_dict[t]
+
     @torch.no_grad()
     def _embeddings_from_feats(self, feats, flatten=True):
         if flatten:
@@ -235,17 +243,21 @@ class MultiTaskPatchGAN(nn.Module):
             return feats.view(N, -1).cpu()
         return feats.mean(dim=[2, 3]).cpu()  # global feature
 
-    def forward(self, x, return_embeddings=False, return_task_embeddings=False, return_full=False):
+    def forward(self, x, return_embeddings=False, return_task_embeddings=False, return_full=False,
+                only: Optional[List[str]] = None):
         x = x.to(self.device)
         feats = self.trunk(x)  # [N, C, H, W]
+
+        tasks_to_run = self._tasks_to_run(only)
 
         if return_task_embeddings:
             outputs = {}
             task_embeddings = {}
-            for task_name, head in self.task_heads.items():
+            for t in tasks_to_run:
+                head = self.task_heads[t]
                 logits, _A = head(feats)
-                outputs[task_name] = logits
-                task_embeddings[task_name] = feats.mean(dim=[2,3]).cpu()  # embedding partagé
+                outputs[t] = logits
+                task_embeddings[t] = feats.mean(dim=[2,3]).cpu()  # embedding partagé
             return outputs, task_embeddings
 
         if return_embeddings:
@@ -253,61 +265,84 @@ class MultiTaskPatchGAN(nn.Module):
             feats_flat = feats.view(N, -1).cpu()
             return feats_flat
 
-        # sortie normale
         if return_full:
             outputs = {}
-            for t, head in self.task_heads.items():
+            for t in tasks_to_run:
+                head = self.task_heads[t]
                 logits, A = head(feats)
                 outputs[t] = {'logits': logits, 'attn': A}
             return outputs
         else:
             outputs = {}
-            for t, head in self.task_heads.items():
+            for t in tasks_to_run:
+                head = self.task_heads[t]
                 logits, _A = head(feats)
                 outputs[t] = logits
             return outputs
 
 # -------------------------------------------------------------------
-# 4) MODELE POUR GRADCAM (sélectionner la tâche) — ADAPTÉ
+# 4) MODELE POUR GRADCAM (sélectionner la tâche)
 # -------------------------------------------------------------------
 class TaskSpecificModel(nn.Module):
-    """
-    Wrap pour extraire le logits d'une tâche spécifique (compat nouvelles sorties).
-    """
     def __init__(self, model, task_name):
         super().__init__()
         self.model = model
         self.task_name = task_name
 
     def forward(self, x):
-        outs = self.model(x, return_full=False)  # compat: dict[str]->Tensor logits
-        return outs[self.task_name]  # [N, nb_classes]
+        outs = self.model(x, return_full=False, only=[self.task_name])
+        return outs[self.task_name]
 
 # -------------------------------------------------------------------
-# 4bis) UTILITAIRES TEST (chargement & params)
+# 5) CHARGEMENT DU MODELE — filtrage par tâches
 # -------------------------------------------------------------------
-# -------------------------------------------------------------------
-# 6) CHARGEMENT DU MODELE
-# -------------------------------------------------------------------
-def load_model_weights(model: nn.Module, path: str, device: torch.device, strict: bool = True):
+def _filter_state_dict_for_tasks(state: Dict[str, torch.Tensor], keep_tasks: Optional[Iterable[str]]) -> Dict[str, torch.Tensor]:
+    """
+    Conserve toujours les clés 'trunk.*'.
+    Si keep_tasks est fourni, ne garde que 'task_heads.<task>.*' correspondantes.
+    """
+    if keep_tasks is None:
+        return dict(state)
+
+    keep = set(keep_tasks)
+    filtered = {}
+    for k, v in state.items():
+        if k.startswith('trunk.'):
+            filtered[k] = v
+            continue
+        if k.startswith('task_heads.'):
+            # k = task_heads.<task>....
+            parts = k.split('.')
+            if len(parts) >= 3:
+                tname = parts[1]
+                if tname in keep:
+                    filtered[k] = v
+    return filtered
+
+def load_model_weights(model: nn.Module, path: str, device: torch.device, strict: bool = True,
+                       keep_tasks: Optional[Iterable[str]] = None):
     ckpt = torch.load(path, map_location=device)
     if isinstance(ckpt, dict):
         state = ckpt.get('model', ckpt.get('state_dict', ckpt))
     else:
         state = ckpt
 
+    # retire 'module.' si présent
     new_state = {}
     for k, v in state.items():
-        nk = k[7:] if k.startswith('module.') else k  # retire DataParallel si présent
+        nk = k[7:] if k.startswith('module.') else k
         new_state[nk] = v
 
-    missing, unexpected = model.load_state_dict(new_state, strict=strict)
+    # filtre par tâches
+    new_state = _filter_state_dict_for_tasks(new_state, keep_tasks)
+
+    # Chargement tolérant (strict=False recommandé dès qu'on élague)
+    missing, unexpected = model.load_state_dict(new_state, strict=False if keep_tasks else strict)
     if missing:
         print(f"[load] Missing keys ({len(missing)}): {missing[:8]}{' ...' if len(missing)>8 else ''}")
     if unexpected:
         print(f"[load] Unexpected keys ({len(unexpected)}): {unexpected[:8]}{' ...' if len(unexpected)>8 else ''}")
-    print(f"[load] strict={strict} -> OK (si pas d'exception)")
-
+    print(f"[load] strict={'False' if keep_tasks else str(strict)} -> OK (si pas d'exception)")
 
 def checkpoint_has_se(path, device='cpu'):
     sd = torch.load(path, map_location=device)
@@ -315,30 +350,23 @@ def checkpoint_has_se(path, device='cpu'):
         sd = sd.get('model', sd.get('state_dict', sd))
     return any('.se.mlp.' in k for k in sd.keys())
 
-
-
-
-
-
-
-
-
-
+# -------------------------------------------------------------------
+# 6) EMBEDDINGS ATTENTION PAR TÂCHE (option: sous-ensemble)
+# -------------------------------------------------------------------
 @torch.no_grad()
-def compute_attn_embeddings_per_task_with_paths(model, loader, device, tasks_json):
+def compute_attn_embeddings_per_task_with_paths(model, loader, device, tasks_json, selected_tasks: Optional[List[str]] = None):
     """
     Extrait des embeddings 'par tâche' pondérés par l'attention:
       e_t = sum_{h,w} (feat * A_t) / sum_{h,w} A_t  -> vecteur [C]
-    Renvoie:
-      - embeddings_data: dict(task -> np.array [N_t, C])
-      - labels_data:     dict(task -> np.array [N_t])
-      - img_paths_data:  dict(task -> List[str]) (aligné avec embeddings/labels de cette tâche)
     Seuls les échantillons avec un label défini pour la tâche sont inclus.
+    - selected_tasks: si fourni, limite le calcul à ce sous-ensemble
     """
     model.eval()
-    embeddings_data = {t: [] for t in tasks_json.keys()}
-    labels_data     = {t: [] for t in tasks_json.keys()}
-    paths_data      = {t: [] for t in tasks_json.keys()}
+    task_list = list(tasks_json.keys()) if not selected_tasks else [t for t in selected_tasks if t in tasks_json]
+
+    embeddings_data = {t: [] for t in task_list}
+    labels_data     = {t: [] for t in task_list}
+    paths_data      = {t: [] for t in task_list}
 
     # hook pour récupérer la sortie du trunk
     feats_cache = []
@@ -354,24 +382,21 @@ def compute_attn_embeddings_per_task_with_paths(model, loader, device, tasks_jso
         bsz = imgs.size(0)
         imgs = imgs.to(device, non_blocking=True)
 
-        # forward complet pour récupérer les cartes d'attention
-        outs = model(imgs, return_full=True)  # dict[task] -> {'logits':..., 'attn':...}
+        # forward complet pour récupérer les cartes d'attention uniquement pour task_list
+        outs = model(imgs, return_full=True, only=task_list)  # dict[task] -> {'logits':..., 'attn':...}
         feats = feats_cache.pop(0)            # [N,C,H,W] sortie du trunk
         N, C, H, W = feats.shape
 
         # par tâche: projeter via A_t
-        for task in tasks_json.keys():
+        for task in task_list:
             A = outs[task]['attn']            # [N,1,H,W]
             lbl_t = labels[task]              # liste de labels (tenseurs ou None)
-            # on ne garde que les échantillons avec label défini
             for i in range(N):
-                # indice global → chemin image
                 img_path = all_paths[ptr + i]
                 lab = lbl_t[i]
                 if lab is None:
                     continue
                 lab = int(lab) if not torch.is_tensor(lab) else int(lab.item())
-                # embedding attention-pondéré
                 Ai = A[i]                     # [1,H,W]
                 Fi = feats[i]                 # [C,H,W]
                 num = (Fi * Ai).sum(dim=(1,2))         # [C]
@@ -384,7 +409,7 @@ def compute_attn_embeddings_per_task_with_paths(model, loader, device, tasks_jso
         ptr += bsz
 
     # convert lists -> arrays
-    for t in tasks_json.keys():
+    for t in task_list:
         if len(embeddings_data[t]) > 0:
             embeddings_data[t] = np.stack(embeddings_data[t], axis=0)
             labels_data[t]     = np.array(labels_data[t])
@@ -395,7 +420,60 @@ def compute_attn_embeddings_per_task_with_paths(model, loader, device, tasks_jso
     h.remove()
     return embeddings_data, labels_data, paths_data
 
-# ------------------------------ MAIN (tous les modes, t-SNE maj) ------------------------------
+# -------------------------------------------------------------------
+# 7) CALCUL EMBEDDINGS (legacy tsne), inchangé
+# -------------------------------------------------------------------
+def compute_embeddings_with_paths(model, loader, device, tasks_json, per_task_tsne=False):
+    model.eval()
+    if per_task_tsne:
+        embeddings_dict = {tname: [] for tname in tasks_json.keys()}
+        labels_dict = {tname: [] for tname in tasks_json.keys()}
+        img_paths_dict = {tname: [] for tname in tasks_json.keys()}
+    else:
+        all_embeddings = []
+        all_labels = []
+        img_paths = []
+    with torch.no_grad():
+        for batch_idx, (inputs, labels) in enumerate(loader):
+            inputs = inputs.to(device)
+            outputs, task_emb = model(inputs, return_task_embeddings=True)
+            batch_size = inputs.size(0)
+            if isinstance(loader.dataset, Subset):
+                indices = loader.dataset.indices[batch_idx * loader.batch_size : batch_idx * loader.batch_size + batch_size]
+                batch_img_paths = [loader.dataset.dataset.samples[idx][0] for idx in indices]
+            else:
+                batch_img_paths = [loader.dataset.samples[idx][0] for idx in range(batch_idx * loader.batch_size,
+                                        batch_idx * loader.batch_size + batch_size)]
+            if per_task_tsne:
+                for tname in tasks_json.keys():
+                    emb_batch = task_emb[tname].cpu().numpy()
+                    label_batch = labels[tname].clone()
+                    label_batch[label_batch < 0] = -1
+                    for i in range(batch_size):
+                        embeddings_dict[tname].append(emb_batch[i])
+                        labels_dict[tname].append(int(label_batch[i].item()) if label_batch[i].item() >= 0 else -1)
+                        img_paths_dict[tname].append(batch_img_paths[i])
+            else:
+                first_task = list(tasks_json.keys())[0]
+                emb_batch = task_emb[first_task].cpu().numpy()
+                label_batch = labels[first_task].clone()
+                label_batch[label_batch < 0] = -1
+                all_embeddings.append(emb_batch)
+                all_labels.append(label_batch.cpu().numpy())
+                img_paths.extend(batch_img_paths)
+    if per_task_tsne:
+        for tname in embeddings_dict.keys():
+            embeddings_dict[tname] = np.array(embeddings_dict[tname])
+            labels_dict[tname] = np.array(labels_dict[tname])
+        return embeddings_dict, labels_dict, img_paths_dict
+    else:
+        all_embeddings = np.concatenate(all_embeddings, axis=0)
+        all_labels = np.concatenate(all_labels, axis=0)
+        return all_embeddings, all_labels, img_paths
+
+# -------------------------------------------------------------------
+# 8) CLI principal — sélection & élagage
+# -------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="Test d'un PatchGAN Multi-tâches avec divers modes")
     # Base / chemins
@@ -469,6 +547,12 @@ def main():
     parser.add_argument('--attn_tau', type=float, default=0.7)
     parser.add_argument('--attn_no_softmax', action='store_true')
 
+    # *** Sélection & élagage des tâches ***
+    parser.add_argument('--active_tasks', type=str, default=None,
+                        help='Liste de tâches à garder (séparées par des virgules). Ex: "Weather Type,Visibility"')
+    parser.add_argument('--prune_heads', action='store_true',
+                        help="Élaguer définitivement les têtes non sélectionnées (modèle allégé)")
+
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -476,15 +560,27 @@ def main():
     writer = (SummaryWriter(log_dir=os.path.join(args.save_dir, 'TensorBoard'))
               if args.tensorboard else None)
 
-    # Hyperparams & tâches
+    # Hyperparams & tâches (complètes)
     with open(args.config_path, 'r') as f:
         best_config = json.load(f)
     with open(args.build_classifier, 'r') as f:
         tasks_json = json.load(f)
-    tasks_dict = {task_name: len(class_list) for task_name, class_list in tasks_json.items()}
-    print(f"Nombre de tâches: {len(tasks_dict)}")
-    for t, n in tasks_dict.items():
-        print(f"  Tâche '{t}': {n} classes")
+    all_tasks_dict = {task_name: len(class_list) for task_name, class_list in tasks_json.items()}
+
+    # Sélection de tâches
+    if args.active_tasks:
+        keep_list = [t.strip() for t in args.active_tasks.split(',') if t.strip()]
+        tasks_dict = {t: all_tasks_dict[t] if t in all_tasks_dict else None for t in keep_list}
+        tasks_dict = {k: v for k, v in tasks_dict.items() if v is not None}
+        if not tasks_dict:
+            raise RuntimeError(f"Aucune tâche valide trouvée dans --active_tasks={args.active_tasks}. "
+                               f"Tâches dispo: {list(all_tasks_dict.keys())}")
+        print(f"[tasks] Sélection: {list(tasks_dict.keys())} / total={len(all_tasks_dict)}")
+    else:
+        # défaut: garder la première tâche uniquement (comme voulu pour l'UI)
+        first = next(iter(all_tasks_dict.keys()))
+        tasks_dict = {first: all_tasks_dict[first]}
+        print(f"[tasks] Par défaut, on garde uniquement: {first}")
 
     # Construction du modèle compatible avec le ckpt
     patch_size = best_config.get('patch_size', 70)
@@ -504,63 +600,19 @@ def main():
         ablate_attention=args.ablate_attention
     ).to(device)
 
-    load_model_weights(model, args.model_path, device, strict=True)
+    # Si on veut élaguer définitivement, le modèle ne contiendra que ces têtes
+    if args.prune_heads:
+        model.prune_to_tasks(tasks_dict.keys())
+        print(f"[prune] Têtes gardées: {list(model.task_heads.keys())}")
 
+    # Charger les poids (filtrage par tâches conservées)
+    load_model_weights(model, args.model_path, device, strict=True, keep_tasks=model.task_heads.keys())
 
+    # (la suite de ton script principal continue ici, inchangée)
+    # ...
 
+# NOTE: _get_loader_paths(...) doit être défini quelque part dans ton projet
+# si ce helper n'est pas dispo dans ce fichier, importe-le ou implémente-le.
 
-
-
-
-
-# -------------------------------------------------------------------
-# 7) CALCUL EMBEDDINGS (pour t-SNE, clustering, etc.)
-# -------------------------------------------------------------------
-def compute_embeddings_with_paths(model, loader, device, tasks_json, per_task_tsne=False):
-    model.eval()
-    if per_task_tsne:
-        embeddings_dict = {tname: [] for tname in tasks_json.keys()}
-        labels_dict = {tname: [] for tname in tasks_json.keys()}
-        img_paths_dict = {tname: [] for tname in tasks_json.keys()}
-    else:
-        all_embeddings = []
-        all_labels = []
-        img_paths = []
-    with torch.no_grad():
-        for batch_idx, (inputs, labels) in enumerate(loader):
-            inputs = inputs.to(device)
-            outputs, task_emb = model(inputs, return_task_embeddings=True)
-            batch_size = inputs.size(0)
-            if isinstance(loader.dataset, Subset):
-                indices = loader.dataset.indices[batch_idx * loader.batch_size : batch_idx * loader.batch_size + batch_size]
-                batch_img_paths = [loader.dataset.dataset.samples[idx][0] for idx in indices]
-            else:
-                batch_img_paths = [loader.dataset.samples[idx][0] for idx in range(batch_idx * loader.batch_size,
-                                        batch_idx * loader.batch_size + batch_size)]
-            if per_task_tsne:
-                for tname in tasks_json.keys():
-                    emb_batch = task_emb[tname].cpu().numpy()
-                    label_batch = labels[tname].clone()
-                    label_batch[label_batch < 0] = -1
-                    for i in range(batch_size):
-                        embeddings_dict[tname].append(emb_batch[i])
-                        labels_dict[tname].append(int(label_batch[i].item()) if label_batch[i].item() >= 0 else -1)
-                        img_paths_dict[tname].append(batch_img_paths[i])
-            else:
-                first_task = list(tasks_json.keys())[0]
-                emb_batch = task_emb[first_task].cpu().numpy()
-                label_batch = labels[first_task].clone()
-                label_batch[label_batch < 0] = -1
-                all_embeddings.append(emb_batch)
-                all_labels.append(label_batch.cpu().numpy())
-                img_paths.extend(batch_img_paths)
-    if per_task_tsne:
-        for tname in embeddings_dict.keys():
-            embeddings_dict[tname] = np.array(embeddings_dict[tname])
-            labels_dict[tname] = np.array(labels_dict[tname])
-        return embeddings_dict, labels_dict, img_paths_dict
-    else:
-        all_embeddings = np.concatenate(all_embeddings, axis=0)
-        all_labels = np.concatenate(all_labels, axis=0)
-        return all_embeddings, all_labels, img_paths
-
+if __name__ == "__main__":
+    main()

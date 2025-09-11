@@ -2,7 +2,8 @@
   "id": "patchgan_mtm",
   "display_name": "Multi-Task PatchGAN (patch=31)",
   "interface": "classifier",
-  "backend": "pytorch",
+  "type": "pytorch",
+  "adapter": "patchgan",
   "weights": "patchgan_attention.pth",
   "input_size": 224,
   "tasks": {
@@ -20,9 +21,15 @@
     "Snow On Window": ["Absent", "Present", "None"]
   },
   "extra": {
+    "preprocess": "tanh",
     "patch_size": 31,
     "attn_tau": 0.7,
     "attn_softmax_spatial": true,
     "attn_use_se": "auto"
+  },
+  "task_selection": {
+    "enabled": true,
+    "default": ["Weather Type"],
+    "prune_on_load": true
   }
 }

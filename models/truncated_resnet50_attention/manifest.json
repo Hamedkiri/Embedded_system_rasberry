@@ -2,28 +2,34 @@
   "id": "truncated_resnet50_attention",
   "display_name": "Truncated ResNet50 (with-attention)",
   "interface": "classifier",
-  "backend": "pytorch",
+  "type": "pytorch",
   "weights": "model_Truncated_ResNet50_With_Attention.pth",
   "input_size": 224,
   "tasks": {
-    "Weather Type": ["Clear","Sun and Clear","Rain","Snow","Fog","Fog and Rain","Fog and Snow","None"],
-    "Weather Intensity": ["Low","Average","High","None"],
-    "Visibility": ["Very Low","Low","Average","Good"],
-    "Sky Condition": ["Unknown","Clear Sky","Partly Cloudy","Cloudy","Overcast","Partly Overcast"],
-    "Precipitation Presence": ["None","Rain","Snow","Hail"],
-    "Precipitation Intensity": ["None","Low","Average","High"],
-    "Ground Condition": ["Dry","Wet","Partly Wet","Snowy","Partly Snowy","Wet and Snowy","Unknown"],
-    "Glare or Reflections": ["Absent","Present"],
-    "Light Conditions": ["Day","Night","Sunset","Sunrise","artificial"],
-    "Road Spray": ["Absent","Present"],
-    "Water On Window": ["Absent","Present","None"],
-    "Snow On Window": ["Absent","Present","None"]
+    "Weather Type": ["Clear", "Sun and Clear", "Rain", "Snow", "Fog", "Fog and Rain", "Fog and Snow", "None"],
+    "Weather Intensity": ["Low", "Average", "High", "None"],
+    "Visibility": ["Very Low", "Low", "Average", "Good"],
+    "Sky Condition": ["Unknown", "Clear Sky", "Partly Cloudy", "Cloudy", "Overcast", "Partly Overcast"],
+    "Precipitation Presence": ["None", "Rain", "Snow", "Hail"],
+    "Precipitation Intensity": ["None", "Low", "Average", "High"],
+    "Ground Condition": ["Dry", "Wet", "Partly Wet", "Snowy", "Partly Snowy", "Wet and Snowy", "Unknown"],
+    "Glare or Reflections": ["Absent", "Present"],
+    "Light Conditions": ["Day", "Night", "Sunset", "Sunrise", "artificial"],
+    "Road Spray": ["Absent", "Present"],
+    "Water On Window": ["Absent", "Present", "None"],
+    "Snow On Window": ["Absent", "Present", "None"]
   },
   "extra": {
+    "preprocess": "imagenet",
     "truncate_after_layer": 10,
     "use_attention": true,
     "attn_token_dim": null,
     "cls_hidden_dims": [],
     "cls_num_layers": 0
+  },
+  "task_selection": {
+    "enabled": true,
+    "default": ["Weather Type"],
+    "prune_on_load": true
   }
 }

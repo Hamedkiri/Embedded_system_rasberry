@@ -1,11 +1,16 @@
+
 # ui_app.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 UI ONLY — PySide6 (Responsive / no-overflow)
-- Interface desktop + mobile + drawer
-- Responsive: adapte la mise en page au redimensionnement (y compris après plein-écran)
-- Drawer: contenu toujours contenu dans la largeur (pas de débordements horizontaux)
+✅ Fixes:
+- Plus de "Internal C++ object ... already deleted" (pas de rebuild de panneaux avec widgets partagés)
+- Drawer construit 1 seule fois, zone "tâches" seule est rafraîchie
+- Anti overflow horizontal dans le drawer (clamp du contenu)
+- Plein écran force le mode desktop (options visibles)
+- Styles: boutons secondaires colorés, action buttons propres
+- Scrim + drawer bien gérés (pas de double connect, pas de fuite)
 """
 
 from __future__ import annotations
@@ -14,13 +19,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import (
-    Qt, QTimer, Signal, QSize, QRect, QPropertyAnimation, QEasingCurve, QEvent
+    Qt, QTimer, Signal, QRect, QPropertyAnimation, QEasingCurve, QEvent
 )
 from PySide6.QtGui import QPixmap, QFont, QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QLineEdit,
     QFileDialog, QCheckBox, QSpinBox, QDoubleSpinBox, QHBoxLayout, QVBoxLayout,
-    QGridLayout, QGroupBox, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
+    QGroupBox, QMessageBox, QDialog, QFormLayout, QDialogButtonBox,
     QTextEdit, QScrollArea, QFrame, QLayout, QToolButton,
     QGraphicsDropShadowEffect, QSizePolicy, QSplitter
 )
@@ -67,8 +72,9 @@ class DrawerSection(QGroupBox):
 class SideDrawer(QFrame):
     """
     Drawer latéral (côté gauche).
+    Anti overflow horizontal:
     - ScrollArea widgetResizable
-    - Anti overflow horizontal: clamp maxWidth au viewport + wrap forms
+    - Clamp maxWidth du contenu au viewport
     """
     closed = Signal()
 
@@ -121,7 +127,7 @@ class SideDrawer(QFrame):
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.scroll.viewport().installEventFilter(self)  # pour clamp largeur
+        self.scroll.viewport().installEventFilter(self)
 
         self.inner = QWidget()
         self.inner.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
@@ -138,6 +144,7 @@ class SideDrawer(QFrame):
         f.setSpacing(8)
 
         self.primaryBtn = QPushButton("Fermer")
+        self.primaryBtn.setProperty("kind", "primary")
         self.primaryBtn.clicked.connect(self.close_drawer)
         f.addStretch()
         f.addWidget(self.primaryBtn)
@@ -149,8 +156,9 @@ class SideDrawer(QFrame):
         self._geom_show = QRect()
         self._geom_hide = QRect()
 
+        self._closing_hook_connected = False
+
     def eventFilter(self, obj, event):
-        # Clamp largeur du contenu au viewport pour éviter tout débordement horizontal
         if obj is self.scroll.viewport() and event.type() in (QEvent.Resize, QEvent.Show):
             self._clamp_inner_width()
         return super().eventFilter(obj, event)
@@ -159,10 +167,8 @@ class SideDrawer(QFrame):
         vpw = self.scroll.viewport().width()
         if vpw <= 0:
             return
-        # laisser respirer un peu (marges internes + scrollbar)
-        maxw = max(200, vpw - 2)
+        maxw = max(220, vpw - 2)
         self.inner.setMaximumWidth(maxw)
-        # clamp aussi les enfants "racines"
         lay = self.inner.layout()
         for i in range(lay.count()):
             it = lay.itemAt(i)
@@ -177,6 +183,7 @@ class SideDrawer(QFrame):
             w = child.widget()
             if w:
                 w.setParent(None)
+                w.deleteLater()
 
         if isinstance(widget_or_layout, QLayout):
             wrap = QWidget()
@@ -225,15 +232,14 @@ class SideDrawer(QFrame):
         self.anim.setStartValue(self._geom_show)
         self.anim.setEndValue(self._geom_hide)
         self.anim.start()
-        self.anim.finished.connect(self._after_close)
+        if not self._closing_hook_connected:
+            self.anim.finished.connect(self._after_close)
+            self._closing_hook_connected = True
 
     def _after_close(self):
-        try:
-            self.anim.finished.disconnect(self._after_close)
-        except Exception:
-            pass
         self.setVisible(False)
         self.closed.emit()
+        # on laisse connected une seule fois; _closing_hook_connected empêche les doublons
 
 
 class TaskSelectionDialog(QDialog):
@@ -258,6 +264,8 @@ class TaskSelectionDialog(QDialog):
         row = QHBoxLayout()
         btnAll = QPushButton("Tout")
         btnNone = QPushButton("Aucun")
+        btnAll.setProperty("kind", "secondary")
+        btnNone.setProperty("kind", "secondary")
         btnAll.clicked.connect(lambda: [c.setChecked(True) for c in self.checks.values()])
         btnNone.clicked.connect(lambda: [c.setChecked(False) for c in self.checks.values()])
         row.addWidget(btnAll)
@@ -266,9 +274,9 @@ class TaskSelectionDialog(QDialog):
         v.addLayout(row)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        v.addWidget(bb)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
-        v.addWidget(bb)
 
     def selected_tasks(self) -> List[str]:
         return [t for t, cb in self.checks.items() if cb.isChecked()]
@@ -292,6 +300,8 @@ class EmailDialog(QDialog):
 
         addBtn = QPushButton("Ajouter pièces jointes…")
         clearBtn = QPushButton("Vider la liste")
+        addBtn.setProperty("kind", "secondary")
+        clearBtn.setProperty("kind", "secondary")
         addBtn.clicked.connect(self._add_attachments)
         clearBtn.clicked.connect(self._clear_attachments)
 
@@ -368,7 +378,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("S.T.I Innovation — Real-time weather detection")
         self.setMinimumSize(920, 560)
 
-        # State
         self._ui_mode: Optional[str] = None
         self._open_drawer: bool = False
         self._adv_anchor: Optional[QWidget] = None
@@ -376,12 +385,24 @@ class MainWindow(QMainWindow):
         self.all_tasks: Dict[str, List[str]] = {}
         self.selected_tasks: List[str] = []
 
+        self._base_qss = ""
+        self._last_scale = 1.0
+
+        self._desktop_built = False
+        self._drawer_built = False
+
+        self._taskChecks: Dict[str, QCheckBox] = {}
+
         self._build_shared_widgets()
         self._build_ui()
 
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
 
     # ───────────────────────── Shared widgets ─────────────────────────
+
+    def _tag_secondary(self, btn: QPushButton):
+        btn.setProperty("kind", "secondary")
+        btn.setCursor(Qt.PointingHandCursor)
 
     def _build_shared_widgets(self):
         # Header
@@ -407,6 +428,7 @@ class MainWindow(QMainWindow):
         self.modelCombo.currentIndexChanged.connect(self._emit_model_changed)
 
         self.reloadBtn = QPushButton("Recharger")
+        self._tag_secondary(self.reloadBtn)
         self.reloadBtn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.reloadBtn.clicked.connect(self.modelsReloadRequested)
 
@@ -415,12 +437,15 @@ class MainWindow(QMainWindow):
         self.deviceLabel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         self.taskDialogBtn = QPushButton("Sélectionner tâches…")
+        self._tag_secondary(self.taskDialogBtn)
         self.taskDialogBtn.clicked.connect(self._open_task_dialog)
 
         self.classesEdit = QLineEdit()
         self.classesEdit.setPlaceholderText("classes JSON (facultatif)")
         self.classesEdit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         self.chooseClasses = QPushButton("Parcourir…")
+        self._tag_secondary(self.chooseClasses)
         self.chooseClasses.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.chooseClasses.clicked.connect(self._choose_classes)
 
@@ -431,6 +456,7 @@ class MainWindow(QMainWindow):
         self.cameraCombo.currentIndexChanged.connect(self._emit_camera_changed)
 
         self.rescanCamBtn = QPushButton("Rafraîchir")
+        self._tag_secondary(self.rescanCamBtn)
         self.rescanCamBtn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.rescanCamBtn.clicked.connect(self.camerasReloadRequested)
 
@@ -460,7 +486,9 @@ class MainWindow(QMainWindow):
 
         self.dirEdit = QLineEdit("runs")
         self.dirEdit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         self.chooseDir = QPushButton("Dossier…")
+        self._tag_secondary(self.chooseDir)
         self.chooseDir.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.chooseDir.clicked.connect(self._choose_dir)
 
@@ -480,6 +508,7 @@ class MainWindow(QMainWindow):
         self.gearBtn.setCursor(Qt.PointingHandCursor)
         self.gearBtn.clicked.connect(lambda: self._toggle_drawer(scroll_to_adv=True))
 
+        # Main actions (colored)
         self.startBtn = QPushButton("▶ Démarrer")
         self.startBtn.setObjectName("startBtn")
         self.stopBtn = QPushButton("■ Stop")
@@ -494,35 +523,41 @@ class MainWindow(QMainWindow):
         self.startBtn.clicked.connect(self.startRequested)
         self.stopBtn.clicked.connect(self.stopRequested)
         self.recBtn.toggled.connect(self.recordToggled)
+
+        self.fullBtn.clicked.connect(self._toggle_fullscreen)
         self.fullBtn.clicked.connect(self.fullscreenRequested)
 
-        # Desktop mirror buttons
-        self.startBtnDesk = QPushButton("▶ Démarrer")
-        self.stopBtnDesk = QPushButton("■ Stop")
-        self.recBtnDesk = QPushButton("● Enregistrer")
+        # Desktop mirror buttons (donner objectName pour QSS)
+        self.startBtnDesk = QPushButton("▶ Démarrer"); self.startBtnDesk.setObjectName("startBtnDesk")
+        self.stopBtnDesk = QPushButton("■ Stop"); self.stopBtnDesk.setObjectName("stopBtnDesk")
+        self.recBtnDesk = QPushButton("● Enregistrer"); self.recBtnDesk.setObjectName("recBtnDesk")
         self.recBtnDesk.setCheckable(True)
-        self.fullBtnDesk = QPushButton("⤢ Plein écran")
+        self.fullBtnDesk = QPushButton("⤢ Plein écran"); self.fullBtnDesk.setObjectName("fullBtnDesk")
 
         self.startBtnDesk.clicked.connect(self.startRequested)
         self.stopBtnDesk.clicked.connect(self.stopRequested)
         self.recBtnDesk.toggled.connect(self.recordToggled)
+        self.fullBtnDesk.clicked.connect(self._toggle_fullscreen)
         self.fullBtnDesk.clicked.connect(self.fullscreenRequested)
 
-        # Playback/share
+        # Playback/share (secondary colored)
         self.playBtn = QPushButton("Lire un enregistrement…")
+        self._tag_secondary(self.playBtn)
         self.playBtn.clicked.connect(self._open_recording_dialog)
 
         self.transferBtn = QPushButton("Transférer fichiers…")
+        self._tag_secondary(self.transferBtn)
         self.transferBtn.clicked.connect(self._transfer_dialog)
 
         self.emailBtn = QPushButton("Envoyer par e-mail…")
+        self._tag_secondary(self.emailBtn)
         self.emailBtn.clicked.connect(self._email_dialog)
 
     # ───────────────────────── Helpers layout ─────────────────────────
 
     def _make_form(self) -> QFormLayout:
         form = QFormLayout()
-        form.setRowWrapPolicy(QFormLayout.WrapLongRows)  # évite débordements
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         form.setLabelAlignment(Qt.AlignLeft)
         form.setFormAlignment(Qt.AlignTop)
@@ -563,7 +598,7 @@ class MainWindow(QMainWindow):
         ht.addStretch()
         root.addWidget(top)
 
-        # Desktop: splitter vidéo / panneau (meilleur responsive)
+        # Desktop: splitter vidéo / panneau
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(8)
@@ -573,7 +608,8 @@ class MainWindow(QMainWindow):
         self.controlsScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.controlsPanelDesktop = QWidget()
         self.controlsScroll.setWidget(self.controlsPanelDesktop)
-        self._mount_controls_desktop()
+
+        self._mount_controls_desktop()  # build once
 
         self.splitter.addWidget(self.videoLabel)
         self.splitter.addWidget(self.controlsScroll)
@@ -592,30 +628,26 @@ class MainWindow(QMainWindow):
         actHelp.triggered.connect(lambda: QMessageBox.information(self, "Aide", "Voir la documentation du projet."))
         self.menuBar().addAction(actHelp)
 
-        # Drawer + scrim
+        # Drawer + scrim (build once)
         self._build_drawer()
 
-        # Style + responsive
+        # Styles + responsive
+        self._rebuild_base_styles()
         self._update_logo_pixmap(1.0)
         self._apply_ui_scale()
         self._apply_responsive_layout(force=True)
 
-    def _clear_layout(self, layout: QLayout):
-        while layout.count():
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.setParent(None)
-
     # ───────────────────────── Desktop controls ─────────────────────────
 
     def _mount_controls_desktop(self):
-        v = self.controlsPanelDesktop.layout() or QVBoxLayout(self.controlsPanelDesktop)
-        self._clear_layout(v)
+        if self._desktop_built:
+            return
+        self._desktop_built = True
+
+        v = QVBoxLayout(self.controlsPanelDesktop)
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(10)
 
-        # Modèle
         boxModel = QGroupBox("Modèle")
         l = QVBoxLayout(boxModel)
         l.setSpacing(8)
@@ -624,14 +656,12 @@ class MainWindow(QMainWindow):
         l.addWidget(self.taskDialogBtn)
         v.addWidget(boxModel)
 
-        # Classes
         boxCls = QGroupBox("Classes")
         l2 = QVBoxLayout(boxCls)
         l2.setSpacing(8)
         l2.addWidget(self._hrow(self.classesEdit, self.chooseClasses, stretch_index=0))
         v.addWidget(boxCls)
 
-        # Camera/runtime
         boxCam = QGroupBox("Caméra & runtime")
         form = self._make_form()
         form.addRow("Caméra :", self._hrow(self.cameraCombo, self.rescanCamBtn, stretch_index=0))
@@ -642,7 +672,6 @@ class MainWindow(QMainWindow):
         v.addWidget(boxCam)
         v.addWidget(self.speedCheck)
 
-        # Export
         boxExp = QGroupBox("Export résumé")
         form2 = self._make_form()
         form2.addRow("Format :", self.formatCombo)
@@ -651,7 +680,6 @@ class MainWindow(QMainWindow):
         boxExp.setLayout(form2)
         v.addWidget(boxExp)
 
-        # Actions
         actionBox = QGroupBox("Actions")
         ha = QHBoxLayout(actionBox)
         ha.setSpacing(8)
@@ -661,7 +689,6 @@ class MainWindow(QMainWindow):
         ha.addWidget(self.fullBtnDesk)
         v.addWidget(actionBox)
 
-        # Share
         share = QGroupBox("Enregistrements & partage")
         ls = QVBoxLayout(share)
         ls.setSpacing(8)
@@ -694,7 +721,7 @@ class MainWindow(QMainWindow):
 
         v.addWidget(bar)
 
-    # ───────────────────────── Drawer content ─────────────────────────
+    # ───────────────────────── Drawer ─────────────────────────
 
     def _build_drawer(self):
         central = self.centralWidget()
@@ -707,120 +734,42 @@ class MainWindow(QMainWindow):
         self.drawer = SideDrawer(central, side="left", title="Options")
         self.drawer.closed.connect(lambda: self._show_scrim(False))
 
-        self._style_app()
         self._layout_drawer(initial=True)
-        self._populate_drawer_content()
+        self._build_drawer_content_once()
 
-    def _style_app(self):
-        # Styles globaux (simples, Pi-friendly)
-        self.setStyleSheet("""
-        QMainWindow { background:#0b1020; color:#e5e7eb; }
-        QFrame#topbar { background:#0f172a; border-radius:14px; }
-        QLabel#appTitle { font-size:18px; font-weight:800; }
-        QGroupBox {
-            border:1px solid #1f2937; border-radius:12px; margin-top:12px; padding-top:10px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin; left:8px; padding: 0 6px; color:#93c5fd; font-weight:700;
-        }
-        QScrollArea { border:none; }
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
-            background:#0f172a; border:1px solid #1f2937; border-radius:10px;
-        }
-        QPushButton {
-            background:#111827; border:1px solid #1f2937; border-radius:12px;
-        }
-        QPushButton:hover { border-color:#334155; }
-        QFrame#drawerLeft {
-            background: #0F172A; color: #e5e7eb;
-            border-top-left-radius:16px; border-bottom-left-radius:16px;
-        }
-        #drawerHeader {
-            background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0EA5E9, stop:1 #6366F1);
-            border-top-left-radius:16px; border-top-right-radius:16px;
-        }
-        #drawerTitle { font-size:18px; font-weight:800; color:#fff; }
-        #drawerSubtitle { font-size:12px; color: rgba(255,255,255,0.85); }
-        #drawerFooter { background:#0b1327; border-bottom-left-radius:16px; border-bottom-right-radius:16px; }
-        QFrame#mobileBar { background:#0f172a; border-radius:14px; }
-        QToolButton#burgerBtn, QToolButton#gearBtn {
-            background:#111827; border:1px solid #1f2937; border-radius:14px;
-            font-weight:900;
-        }
-        """)
+    def _build_drawer_content_once(self):
+        if self._drawer_built:
+            return
+        self._drawer_built = True
 
-    def _layout_drawer(self, initial=False):
-        if self.drawer:
-            self.drawer.layout_now(initial=initial)
-        if self.scrim and self.centralWidget():
-            self.scrim.setGeometry(self.centralWidget().rect())
-
-    def _make_tasks_widget(self) -> QWidget:
-        wrap = QWidget()
-        lay = QVBoxLayout(wrap)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
-
-        self._taskChecks: Dict[str, QCheckBox] = {}
-
-        if not self.all_tasks:
-            lbl = QLabel("Aucune tâche (sélectionnez un modèle).")
-            lbl.setWordWrap(True)
-            lay.addWidget(lbl)
-            return wrap
-
-        info = QLabel("Tâches (affichage + prune au démarrage) :")
-        info.setWordWrap(True)
-        info.setStyleSheet("color:#cbd5e1;")
-        lay.addWidget(info)
-
-        for t in self.all_tasks.keys():
-            cb = QCheckBox(t)
-            cb.setChecked(t in self.selected_tasks)
-            cb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self._taskChecks[t] = cb
-            lay.addWidget(cb)
-
-        row = QHBoxLayout()
-        btnAll = QPushButton("Tout")
-        btnNone = QPushButton("Aucun")
-        btnApply = QPushButton("Appliquer")
-        btnAll.clicked.connect(lambda: [c.setChecked(True) for c in self._taskChecks.values()])
-        btnNone.clicked.connect(lambda: [c.setChecked(False) for c in self._taskChecks.values()])
-        btnApply.clicked.connect(self._apply_task_selection_from_drawer)
-
-        row.addWidget(btnAll)
-        row.addWidget(btnNone)
-        row.addStretch(1)
-        row.addWidget(btnApply)
-        lay.addLayout(row)
-        return wrap
-
-    def _populate_drawer_content(self):
-        outer = QVBoxLayout()
+        root = QWidget()
+        outer = QVBoxLayout(root)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(12)
 
-        # mini nav
         navW = QWidget()
         nav = QHBoxLayout(navW)
         nav.setContentsMargins(0, 0, 0, 0)
         nav.setSpacing(8)
         btnAdv = QPushButton("Aller à Avancé")
+        btnAdv.setProperty("kind", "secondary")
         btnAdv.clicked.connect(self._scroll_to_advanced)
         nav.addWidget(QLabel("Options"))
         nav.addStretch(1)
         nav.addWidget(btnAdv)
         outer.addWidget(navW)
 
-        # Modèle & tâches
         secModel = DrawerSection("Modèle & tâches")
         secModel.layout().addWidget(self._hrow(self.modelCombo, self.reloadBtn, stretch_index=0))
         secModel.layout().addWidget(self.deviceLabel)
-        secModel.layout().addWidget(self._make_tasks_widget())
+
+        self._drawer_tasks_container = QWidget()
+        self._drawer_tasks_layout = QVBoxLayout(self._drawer_tasks_container)
+        self._drawer_tasks_layout.setContentsMargins(0, 0, 0, 0)
+        self._drawer_tasks_layout.setSpacing(8)
+        secModel.layout().addWidget(self._drawer_tasks_container)
         outer.addWidget(secModel)
 
-        # Caméra
         secCam = DrawerSection("Caméra & runtime")
         formc = self._make_form()
         formc.addRow("Caméra :", self._hrow(self.cameraCombo, self.rescanCamBtn, stretch_index=0))
@@ -831,17 +780,14 @@ class MainWindow(QMainWindow):
         secCam.layout().addWidget(self.speedCheck)
         outer.addWidget(secCam)
 
-        # Anchor
         self._adv_anchor = QLabel("")
         self._adv_anchor.setFixedHeight(1)
         outer.addWidget(self._adv_anchor)
 
-        # Classes
         secCls = DrawerSection("Classes")
         secCls.layout().addWidget(self._hrow(self.classesEdit, self.chooseClasses, stretch_index=0))
         outer.addWidget(secCls)
 
-        # Export
         secExp = DrawerSection("Export / Session")
         form2 = self._make_form()
         form2.addRow("Format :", self.formatCombo)
@@ -850,14 +796,70 @@ class MainWindow(QMainWindow):
         secExp.layout().addLayout(form2)
         outer.addWidget(secExp)
 
-        # Share
         secShare = DrawerSection("Enregistrements & partage")
         secShare.layout().addWidget(self.playBtn)
         secShare.layout().addWidget(self.transferBtn)
         secShare.layout().addWidget(self.emailBtn)
         outer.addWidget(secShare)
 
-        self.drawer.setContent(outer)
+        self.drawer.setContent(root)
+
+        self._refresh_drawer_tasks()
+
+    def _refresh_drawer_tasks(self):
+        if not hasattr(self, "_drawer_tasks_layout"):
+            return
+
+        while self._drawer_tasks_layout.count():
+            it = self._drawer_tasks_layout.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+        self._taskChecks = {}
+
+        if not self.all_tasks:
+            lbl = QLabel("Aucune tâche (sélectionnez un modèle).")
+            lbl.setWordWrap(True)
+            self._drawer_tasks_layout.addWidget(lbl)
+            return
+
+        info = QLabel("Tâches (affichage + prune au démarrage) :")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#cbd5e1;")
+        self._drawer_tasks_layout.addWidget(info)
+
+        for t in self.all_tasks.keys():
+            cb = QCheckBox(t)
+            cb.setChecked(t in self.selected_tasks)
+            self._taskChecks[t] = cb
+            self._drawer_tasks_layout.addWidget(cb)
+
+        rowW = QWidget()
+        row = QHBoxLayout(rowW)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        btnAll = QPushButton("Tout");   btnAll.setProperty("kind", "secondary")
+        btnNone = QPushButton("Aucun"); btnNone.setProperty("kind", "secondary")
+        btnApply = QPushButton("Appliquer"); btnApply.setProperty("kind", "primary")
+
+        btnAll.clicked.connect(lambda: [c.setChecked(True) for c in self._taskChecks.values()])
+        btnNone.clicked.connect(lambda: [c.setChecked(False) for c in self._taskChecks.values()])
+        btnApply.clicked.connect(self._apply_task_selection_from_drawer)
+
+        row.addWidget(btnAll)
+        row.addWidget(btnNone)
+        row.addStretch(1)
+        row.addWidget(btnApply)
+
+        self._drawer_tasks_layout.addWidget(rowW)
+
+    def _layout_drawer(self, initial=False):
+        if getattr(self, "drawer", None):
+            self.drawer.layout_now(initial=initial)
+        if getattr(self, "scrim", None) and self.centralWidget():
+            self.scrim.setGeometry(self.centralWidget().rect())
 
     def _scroll_to_advanced(self):
         if self.drawer and self._adv_anchor:
@@ -880,13 +882,13 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(240, self._scroll_to_advanced)
 
     def _close_drawer(self):
-        if self.drawer and self._open_drawer:
+        if getattr(self, "drawer", None) and self._open_drawer:
             self.drawer.close_drawer()
         self._open_drawer = False
         self._show_scrim(False)
 
     def _show_scrim(self, show: bool):
-        if not self.scrim:
+        if not getattr(self, "scrim", None):
             return
         self.scrim.setVisible(show)
         if show:
@@ -899,7 +901,6 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self._apply_responsive_layout(force=True))
 
     def changeEvent(self, e):
-        # utile quand on sort/entre du plein écran (Qt parfois envoie WindowStateChange)
         super().changeEvent(e)
         if e.type() == QEvent.WindowStateChange:
             QTimer.singleShot(0, self._apply_responsive_layout)
@@ -918,8 +919,10 @@ class MainWindow(QMainWindow):
         super().keyPressEvent(e)
 
     def _is_mobile(self) -> bool:
+        # IMPORTANT: en plein écran, on force le mode desktop (options visibles)
+        if self.isFullScreen():
+            return False
         w, h = self.width(), self.height()
-        # breakpoint plus robuste (plein écran puis réduction)
         return (w < 980) or (h < 620)
 
     def _apply_responsive_layout(self, force=False):
@@ -927,23 +930,18 @@ class MainWindow(QMainWindow):
         mode = self._ui_mode
 
         if mobile and mode != "mobile":
-            # Mobile mode: hide desktop controls; show mobile bar; video takes full width
             self.logo.setVisible(False)
             self.appTitle.setVisible(False)
             self.controlsScroll.setVisible(False)
-            self.splitter.setVisible(True)  # on garde splitter pour le layout; mais on masque le panneau
+            self.splitter.setVisible(True)
             self.mobilePanel.setVisible(True)
 
-            # force splitter ratio: video only
             self.splitter.widget(0).setVisible(True)
             self.splitter.widget(1).setVisible(False)
-            self.splitter.setStretchFactor(0, 1)
 
-            self._populate_drawer_content()
             self._ui_mode = "mobile"
 
         elif (not mobile) and mode != "desktop":
-            # Desktop mode
             self.logo.setVisible(True)
             self.appTitle.setVisible(True)
             self.controlsScroll.setVisible(True)
@@ -952,57 +950,133 @@ class MainWindow(QMainWindow):
             self.splitter.widget(0).setVisible(True)
             self.splitter.widget(1).setVisible(True)
 
-            # keep a sensible default split
-            QTimer.singleShot(0, lambda: self._ensure_splitter_sizes())
+            QTimer.singleShot(0, self._ensure_splitter_sizes)
             self._close_drawer()
-            self._mount_controls_desktop()
             self._ui_mode = "desktop"
 
-        # If desktop, drawer must be closed
         if (not mobile) and self._open_drawer:
             self._close_drawer()
 
+        if (not mobile):
+            QTimer.singleShot(0, self._ensure_splitter_sizes)
+
     def _ensure_splitter_sizes(self):
-        # Avoid too small controls on resize
         if not self.splitter.isVisible():
             return
+        if self.splitter.count() < 2:
+            return
+        sizes = self.splitter.sizes()
         w = self.splitter.width()
         if w <= 0:
             return
-        # video ~65%, panel ~35%
-        self.splitter.setSizes([int(w * 0.66), int(w * 0.34)])
+
+        min_panel = 280
+        if len(sizes) >= 2 and sizes[1] < min_panel:
+            self.splitter.setSizes([int(w * 0.66), int(w * 0.34)])
+
+    # ───────────────────────── Styles / scale ─────────────────────────
+
+    def _rebuild_base_styles(self):
+        self._base_qss = """
+        QMainWindow { background:#0b1020; color:#e5e7eb; }
+        QFrame#topbar { background:#0f172a; border-radius:14px; }
+        QLabel#appTitle { font-size:18px; font-weight:800; }
+
+        QGroupBox {
+            border:1px solid #1f2937; border-radius:12px; margin-top:12px; padding-top:10px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin; left:8px; padding: 0 6px; color:#93c5fd; font-weight:700;
+        }
+        QScrollArea { border:none; }
+
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+            background:#0f172a; border:1px solid #1f2937; border-radius:10px;
+            color:#e5e7eb;
+        }
+
+        QPushButton {
+            background:#1f2937; border:1px solid #334155; border-radius:12px;
+            color:#f8fafc;
+        }
+        QPushButton:hover { background:#243447; border-color:#475569; }
+
+        QPushButton[kind="secondary"] {
+            background:#1d4ed8; border:1px solid #2563eb;
+            color:white; font-weight:700;
+        }
+        QPushButton[kind="secondary"]:hover { background:#2563eb; }
+
+        QPushButton[kind="primary"] {
+            background:#6366f1; border:1px solid #818cf8;
+            color:white; font-weight:800;
+        }
+        QPushButton[kind="primary"]:hover { background:#4f46e5; }
+
+        QFrame#drawerLeft {
+            background: #0F172A; color: #e5e7eb;
+            border-top-left-radius:16px; border-bottom-left-radius:16px;
+        }
+        #drawerHeader {
+            background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #0EA5E9, stop:1 #6366F1);
+            border-top-left-radius:16px; border-top-right-radius:16px;
+        }
+        #drawerTitle { font-size:18px; font-weight:800; color:#fff; }
+        #drawerSubtitle { font-size:12px; color: rgba(255,255,255,0.85); }
+        #drawerFooter { background:#0b1327; border-bottom-left-radius:16px; border-bottom-right-radius:16px; }
+
+        QFrame#mobileBar { background:#0f172a; border-radius:14px; }
+        QToolButton#burgerBtn, QToolButton#gearBtn {
+            background:#334155; border:1px solid #475569; border-radius:14px;
+            color:white; font-weight:900;
+        }
+        QToolButton#burgerBtn:hover, QToolButton#gearBtn:hover { background:#475569; }
+        """
 
     def _apply_ui_scale(self):
         w, h = max(640, self.width()), max(480, self.height())
         ui_scale = max(0.85, min(1.25, min(w / 1280.0, h / 720.0)))
-        base_pt = 11.0 * ui_scale
+        self._last_scale = ui_scale
 
         f = QFont(self.font())
-        f.setPointSizeF(base_pt)
+        f.setPointSizeF(11.0 * ui_scale)
         self.setFont(f)
 
         pad = max(6, int(8 * ui_scale))
-        # styles légers: padding/tailles de boutons, sans casser le style global
-        self.setStyleSheet(self.styleSheet() + f"""
+        tool = max(42, int(44 * ui_scale))
+        icon_fs = int(18 * ui_scale)
+
+        scaled_qss = self._base_qss + f"""
         QPushButton {{ padding:{pad}px {pad+4}px; }}
         QToolButton#burgerBtn, QToolButton#gearBtn {{
-            min-width:{max(42,int(44*ui_scale))}px;
-            min-height:{max(42,int(44*ui_scale))}px;
-            font-size:{int(18*ui_scale)}px;
+            min-width:{tool}px; min-height:{tool}px; font-size:{icon_fs}px;
         }}
-        QPushButton#startBtn {{ background:#16a34a; color:white; font-weight:800; border-radius:16px; }}
-        QPushButton#stopBtn  {{ background:#dc2626; color:white; font-weight:800; border-radius:16px; }}
-        QPushButton#recBtn   {{ background:#ef4444; color:white; font-weight:800; border-radius:16px; }}
-        QPushButton#fullBtn  {{ background:#334155; color:white; font-weight:800; border-radius:16px; }}
-        """)
 
+        QPushButton#startBtn, QPushButton#startBtnDesk {{
+            background:#16a34a; border:1px solid #22c55e; color:white; font-weight:900; border-radius:16px;
+        }}
+        QPushButton#stopBtn, QPushButton#stopBtnDesk {{
+            background:#dc2626; border:1px solid #ef4444; color:white; font-weight:900; border-radius:16px;
+        }}
+        QPushButton#recBtn, QPushButton#recBtnDesk {{
+            background:#f43f5e; border:1px solid #fb7185; color:white; font-weight:900; border-radius:16px;
+        }}
+        QPushButton#fullBtn, QPushButton#fullBtnDesk {{
+            background:#0ea5e9; border:1px solid #38bdf8; color:white; font-weight:900; border-radius:16px;
+        }}
+        """
+
+        self.setStyleSheet(scaled_qss)
         self._update_logo_pixmap(ui_scale)
+
+    # ───────────────────────── Fullscreen ─────────────────────────
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showNormal()
         else:
             self.showFullScreen()
+        QTimer.singleShot(0, lambda: self._apply_responsive_layout(force=True))
 
     def _update_logo_pixmap(self, scale: float):
         base_h = 34
@@ -1050,7 +1124,7 @@ class MainWindow(QMainWindow):
             self.tasksSelectionChanged.emit(sel)
 
     def _apply_task_selection_from_drawer(self):
-        if not hasattr(self, "_taskChecks"):
+        if not self._taskChecks:
             return
         sel = [t for t, cb in self._taskChecks.items() if cb.isChecked()]
         if not sel:
@@ -1113,8 +1187,7 @@ class MainWindow(QMainWindow):
     def set_tasks(self, all_tasks: Dict[str, List[str]], selected_tasks: List[str]):
         self.all_tasks = dict(all_tasks or {})
         self.selected_tasks = list(selected_tasks or [])
-        if self._is_mobile():
-            self._populate_drawer_content()
+        self._refresh_drawer_tasks()
 
     def set_device_text(self, txt: str):
         self.deviceLabel.setText(txt)

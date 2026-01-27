@@ -1183,26 +1183,38 @@ class MainWindow(QMainWindow):
     def _rebuild_base_styles(self):
         self._base_qss = """
         /* ─────────────────────────
-           Palette (dark + cool accent)
-           bg0  : #0b1020 (main)
-           bg1  : #0f172a (surface)
-           bg2  : #111c33 (surface alt)
-           line : #233047 / #2b3a55
-           text : #e6edf7
-           mut  : #a9b4c7
-           acc  : #60a5fa (blue)
-           pri  : #7c3aed (violet)
-           ok   : #22c55e
-           warn : #f59e0b
-           bad  : #ef4444
+           Global dark theme (force text readability everywhere)
         ───────────────────────── */
+
+        /* 1) FORCE a readable default on everything */
+        * {
+            color: #e6edf7;
+            background: transparent;
+            selection-background-color: rgba(96,165,250,0.35);
+            selection-color: #0b1020;
+        }
 
         QMainWindow {
             background:#0b1020;
             color:#e6edf7;
         }
 
-        /* Top bar */
+        /* 2) Common containers (prevent "white panel" surprises) */
+        QWidget, QFrame, QDialog {
+            background: transparent;
+            color:#e6edf7;
+        }
+        QMenuBar, QMenu, QStatusBar, QToolTip {
+            background:#0f172a;
+            color:#e6edf7;
+            border:1px solid #233047;
+        }
+        QMenu::item:selected {
+            background: rgba(96,165,250,0.22);
+            color:#e6edf7;
+        }
+
+        /* 3) Top bar */
         QFrame#topbar {
             background:#0f172a;
             border:1px solid #233047;
@@ -1214,13 +1226,14 @@ class MainWindow(QMainWindow):
             color:#e6edf7;
         }
 
-        /* Group boxes */
+        /* 4) Group boxes */
         QGroupBox {
             border:1px solid #233047;
             border-radius:12px;
             margin-top:12px;
             padding-top:10px;
-            background: #0f172a;
+            background:#0f172a;              /* ensure not white */
+            color:#e6edf7;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
@@ -1230,27 +1243,59 @@ class MainWindow(QMainWindow):
             font-weight:800;
         }
 
-        QScrollArea { border:none; }
-        QLabel { color:#e6edf7; }
-        QLabel[muted="true"] { color:#a9b4c7; }
+        /* 5) Scroll areas / viewports (common source of white background) */
+        QScrollArea {
+            border:none;
+            background: transparent;
+        }
+        QScrollArea > QWidget > QWidget {
+            background: transparent;         /* viewport content */
+            color:#e6edf7;
+        }
 
-        /* Inputs */
-        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+        /* 6) Text widgets (another frequent white background source) */
+        QLabel { color:#e6edf7; background: transparent; }
+        QTextEdit, QPlainTextEdit {
             background:#111c33;
             border:1px solid #2b3a55;
             border-radius:10px;
             color:#e6edf7;
-            selection-background-color: rgba(96,165,250,0.35);
         }
-        QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+
+        /* 7) Inputs */
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+            background:#111c33;
+            border:1px solid #2b3a55;
+            border-radius:10px;
+            color:#e6edf7;
+        }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+        QTextEdit:focus, QPlainTextEdit:focus {
             border:1px solid #60a5fa;
         }
-        QLineEdit::placeholder, QTextEdit::placeholder {
+        QLineEdit::placeholder {
             color: rgba(169,180,199,0.55);
         }
 
-        /* Checkboxes */
-        QCheckBox { color:#e6edf7; }
+        /* 8) Combobox popup list (often white) */
+        QAbstractItemView {
+            background:#0f172a;
+            color:#e6edf7;
+            border:1px solid #233047;
+            selection-background-color: rgba(96,165,250,0.22);
+            selection-color:#e6edf7;
+            outline: 0;
+        }
+
+        /* 9) SpinBox buttons (sometimes visible white) */
+        QSpinBox::up-button, QSpinBox::down-button,
+        QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+            background:#111c33;
+            border-left:1px solid #2b3a55;
+        }
+
+        /* 10) Checkboxes */
+        QCheckBox { color:#e6edf7; background: transparent; }
         QCheckBox::indicator { width:16px; height:16px; }
         QCheckBox::indicator:unchecked {
             border:1px solid #2b3a55;
@@ -1263,7 +1308,7 @@ class MainWindow(QMainWindow):
             background: rgba(96,165,250,0.35);
         }
 
-        /* Buttons (base) */
+        /* 11) Buttons */
         QPushButton {
             background:#111c33;
             border:1px solid #2b3a55;
@@ -1281,7 +1326,6 @@ class MainWindow(QMainWindow):
             border-color:#1f2a3f;
         }
 
-        /* Secondary = accent blue */
         QPushButton[kind="secondary"] {
             background: rgba(96,165,250,0.18);
             border:1px solid rgba(96,165,250,0.55);
@@ -1293,7 +1337,6 @@ class MainWindow(QMainWindow):
             border-color: rgba(96,165,250,0.75);
         }
 
-        /* Primary = violet */
         QPushButton[kind="primary"] {
             background: rgba(124,58,237,0.22);
             border:1px solid rgba(124,58,237,0.65);
@@ -1305,10 +1348,10 @@ class MainWindow(QMainWindow):
             border-color: rgba(124,58,237,0.85);
         }
 
-        /* Drawer */
+        /* 12) Drawer */
         QFrame#drawerLeft {
-            background: #0f172a;
-            color: #e6edf7;
+            background:#0f172a;
+            color:#e6edf7;
             border-top-left-radius:16px;
             border-bottom-left-radius:16px;
             border:1px solid #233047;
@@ -1328,11 +1371,12 @@ class MainWindow(QMainWindow):
             border-top:1px solid #233047;
         }
 
-        /* Mobile bar + tool buttons */
+        /* 13) Mobile bar + tool buttons */
         QFrame#mobileBar {
             background:#0f172a;
             border:1px solid #233047;
             border-radius:14px;
+            color:#e6edf7;
         }
         QToolButton#burgerBtn, QToolButton#gearBtn {
             background:#111c33;
@@ -1344,6 +1388,16 @@ class MainWindow(QMainWindow):
         QToolButton#burgerBtn:hover, QToolButton#gearBtn:hover {
             background:#152243;
             border-color:#3a4c70;
+        }
+
+        /* 14) Message boxes / dialogs (often white) */
+        QMessageBox, QDialog {
+            background:#0f172a;
+            color:#e6edf7;
+        }
+        QMessageBox QLabel {
+            color:#e6edf7;
+            background: transparent;
         }
         """
 

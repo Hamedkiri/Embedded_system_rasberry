@@ -797,11 +797,19 @@ class SessionManager(QObject):
     - Ouverture caméra
     - Thread d’inférence
     - Tick capture (appelé depuis UI via timer/Controller)
-    - Export
+    - Recording + export
+
+    Correctifs principaux vs version précédente :
+    - Démarrage/arrêt robustes (pas de QThread zombie, stop idempotent)
+    - Gestion sûre des frames (copie avant submit au worker, drop si backlog)
+    - Re-open caméra plus stable (retente le backend sélectionné puis auto)
+    - Noms de session cohérents (base_name mémorisé, collect_latest_session_files fiable)
+    - Export robuste (start_time absent → pas de crash)
+    - tick() ne plante jamais : erreurs → signal error/info, et retour silencieux
     """
 
     # Signals → Controller/UI
-    tasksLoaded = Signal(dict, list)        # all_tasks, selected_tasks
+    tasksLoaded = Signal(dict, list)        # tasks_dict, tasks_order
     deviceChanged = Signal(str)             # "CPU" / "GPU"
     frameReady = Signal(object)             # QPixmap
     speedText = Signal(str)
@@ -815,6 +823,7 @@ class SessionManager(QObject):
         # Runtime state
         self.cap = None
         self.cap_backend = None
+        self.cap_index = None
         self.lc_mjpeg: Optional[LibcameraMJPEGCapture] = None
 
         self.current_adapter: Optional[BaseAdapter] = None
@@ -848,10 +857,14 @@ class SessionManager(QObject):
         self.video_writer = None
 
         self.summary_rows: List[Dict[str, Any]] = []
-        self.meta = {}
+        self.meta: Dict[str, Any] = {}
         self.session_started_at: Optional[datetime.datetime] = None
 
-        # Playback
+        # Session naming (important for export + collect_latest_session_files)
+        self.session_name = ""
+        self._last_session_base_name: str = ""   # mémorise le dernier nom réellement utilisé
+
+        # Playback (si tu en as besoin ensuite)
         self.playback_mode = False
         self.play_fps = 25.0
 
@@ -861,8 +874,13 @@ class SessionManager(QObject):
         self.prob_threshold = 0.5
         self.show_speed = False
         self.export_format = "json"
-        self.session_name = ""
         self.classes_json_path = ""
+
+        # Tick pacing (évite surchauffe UI si timer trop rapide)
+        self._last_tick_t = 0.0
+
+        # Partage thread-safe minimal (évite incohérences UI pendant update)
+        self._lock = threading.Lock()
 
     # ───────────────────────── Models / tasks ─────────────────────────
 
@@ -893,13 +911,20 @@ class SessionManager(QObject):
 
         # 1) classes.json si fourni
         if self.classes_json_path and Path(self.classes_json_path).exists():
-            data = json.loads(Path(self.classes_json_path).read_text(encoding="utf-8"))
-            return {k: list(v) for k, v in data.items()}
+            try:
+                data = json.loads(Path(self.classes_json_path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): list(v) for k, v in data.items()}
+            except Exception as e:
+                self.error.emit(f"classes_json_path invalide: {e}")
 
         # 2) config/manifest
-        cfg = ModelRegistry.read_config(model_path)
-        if "tasks" in cfg and isinstance(cfg["tasks"], dict):
-            return {k: list(v) for k, v in cfg["tasks"].items()}
+        try:
+            cfg = ModelRegistry.read_config(model_path)
+            if isinstance(cfg, dict) and "tasks" in cfg and isinstance(cfg["tasks"], dict):
+                return {k: list(v) for k, v in cfg["tasks"].items()}
+        except Exception as e:
+            self.error.emit(f"Impossible de lire config modèle: {e}")
 
         # 3) fallback
         return {"Weather": ["No", "Yes"]}
@@ -916,20 +941,28 @@ class SessionManager(QObject):
         return entries
 
     def _try_open_v4l2(self, cam_index: int, w: int, h: int, fps: int):
-        trials = [("MJPG", cv2.VideoWriter_fourcc(*"MJPG")), ("YUYV", cv2.VideoWriter_fourcc(*"YUYV")), ("AUTO", None)]
+        trials = [
+            ("MJPG", cv2.VideoWriter_fourcc(*"MJPG")),
+            ("YUYV", cv2.VideoWriter_fourcc(*"YUYV")),
+            ("AUTO", None),
+        ]
         for label, fourcc in trials:
             cap = cv2.VideoCapture(cam_index, cv2.CAP_V4L2)
             if not cap or not cap.isOpened():
                 continue
-            if fourcc is not None:
-                cap.set(cv2.CAP_PROP_FOURCC, fourcc)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
-            cap.set(cv2.CAP_PROP_FPS, fps)
+            try:
+                if fourcc is not None:
+                    cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                cap.set(cv2.CAP_PROP_FPS, fps)
 
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                return cap
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    self.info.emit(f"Caméra V4L2 ouverte (idx={cam_index}, {label})")
+                    return cap
+            except Exception:
+                pass
             cap.release()
         return None
 
@@ -949,60 +982,92 @@ class SessionManager(QObject):
             self.lc_mjpeg = None
 
         self.cap_backend = None
+        self.cap_index = None
         self._read_fail = 0
 
     def _open_camera_backend(self, backend: str, index: Optional[int]) -> bool:
+        """
+        Ouvre une source. Mémorise cap_backend/cap_index en cas de succès.
+        """
         self._release_camera()
 
         w = int(os.getenv("PI_CAM_WIDTH", "1280"))
         h = int(os.getenv("PI_CAM_HEIGHT", "720"))
         fps = int(os.getenv("PI_CAM_FPS", "30"))
 
-        if backend == "gst":
-            if cv_has_gstreamer():
-                pipe = default_gst_pipeline()
-                cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
-                if cap is not None and cap.isOpened():
-                    ok, frame = cap.read()
+        backend = (backend or "auto").strip()
+
+        try:
+            if backend == "gst":
+                if cv_has_gstreamer():
+                    pipe = default_gst_pipeline()
+                    cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
+                    if cap is not None and cap.isOpened():
+                        ok, frame = cap.read()
+                        if ok and frame is not None:
+                            self.cap = cap
+                            self.cap_backend = "gst"
+                            self.cap_index = None
+                            self.info.emit("Caméra ouverte via GStreamer.")
+                            return True
+                        cap.release()
+                return False
+
+            if backend == "lc-mjpeg":
+                self.lc_mjpeg = LibcameraMJPEGCapture(w, h, fps)
+                if self.lc_mjpeg.start():
+                    t0 = time.time()
+                    ok, frame = False, None
+                    while time.time() - t0 < 1.2 and not ok:
+                        ok, frame = self.lc_mjpeg.read()
+                        if not ok:
+                            time.sleep(0.02)
                     if ok and frame is not None:
-                        self.cap = cap
-                        self.cap_backend = "gst"
+                        self.cap_backend = "lc-mjpeg"
+                        self.cap_index = None
+                        self.info.emit("Caméra ouverte via libcamera MJPEG pipe.")
                         return True
-                    cap.release()
-            return False
-
-        if backend == "lc-mjpeg":
-            self.lc_mjpeg = LibcameraMJPEGCapture(w, h, fps)
-            if self.lc_mjpeg.start():
-                t0 = time.time()
-                ok, frame = False, None
-                while time.time() - t0 < 1.2 and not ok:
-                    ok, frame = self.lc_mjpeg.read()
-                    if not ok:
-                        time.sleep(0.02)
-                if ok and frame is not None:
-                    self.cap_backend = "lc-mjpeg"
-                    return True
-                self.lc_mjpeg.release()
+                try:
+                    self.lc_mjpeg.release()
+                except Exception:
+                    pass
                 self.lc_mjpeg = None
-            return False
+                return False
 
-        if backend == "v4l2":
-            idx = 0 if index is None else int(index)
-            cap = self._try_open_v4l2(idx, w, h, fps)
-            if cap:
-                self.cap = cap
-                self.cap_backend = "v4l2"
-                return True
-            return False
-
-        if backend == "auto":
-            for pref in [("gst", None), ("lc-mjpeg", None), ("v4l2", 0)]:
-                if self._open_camera_backend(pref[0], pref[1]):
+            if backend == "v4l2":
+                idx = 0 if index is None else int(index)
+                cap = self._try_open_v4l2(idx, w, h, fps)
+                if cap:
+                    self.cap = cap
+                    self.cap_backend = "v4l2"
+                    self.cap_index = idx
                     return True
+                return False
+
+            if backend == "auto":
+                # ordre : gst -> lc-mjpeg -> v4l2
+                for pref_backend, pref_idx in [("gst", None), ("lc-mjpeg", None), ("v4l2", 0)]:
+                    if self._open_camera_backend(pref_backend, pref_idx):
+                        return True
+                return False
+
+        except Exception as e:
+            self.error.emit(f"Erreur ouverture caméra ({backend}): {e}")
+            self._release_camera()
             return False
 
         return False
+
+    def _reopen_camera_safely(self):
+        """
+        Tente de rouvrir le backend courant (si connu), sinon auto.
+        """
+        b = self.cap_backend or "auto"
+        idx = self.cap_index
+        if b != "auto":
+            if self._open_camera_backend(b, idx):
+                return
+        self._open_camera_backend("auto", None)
 
     # ───────────────────────── Start/Stop session ─────────────────────────
 
@@ -1016,29 +1081,50 @@ class SessionManager(QObject):
         """
         model_path = str(model_path).strip()
         if not model_path or not Path(model_path).exists():
-            raise RuntimeError("Aucun modèle valide sélectionné.")
+            self.error.emit("Aucun modèle valide sélectionné.")
+            return
+
+        # Stop propre si session déjà active
+        try:
+            self.stop_session()
+        except Exception:
+            pass
 
         # Tasks
         self.all_tasks = self.load_tasks_for_model(model_path)
+        if not self.all_tasks:
+            self.error.emit("Impossible de charger les tâches du modèle.")
+            return
+
         if not self.selected_tasks:
             self.selected_tasks = list(self.all_tasks.keys())
-        self.tasks = {k: v for k, v in self.all_tasks.items() if k in self.selected_tasks}
-        self.tasks_order = list(self.selected_tasks)
 
         # Device
-        self.device = "cuda" if hasattr(torch, "cuda") and getattr(torch.cuda, "is_available", lambda: False)() else "cpu"
+        try:
+            self.device = "cuda" if hasattr(torch, "cuda") and torch.cuda.is_available() else "cpu"
+        except Exception:
+            self.device = "cpu"
         self.deviceChanged.emit("GPU" if self.device == "cuda" else "CPU")
 
         # Adapter + prune
-        self.current_adapter = ModelRegistry.create(
-            model_path=model_path,
-            tasks=self.all_tasks,
-            device=self.device,
-            extra=None,
-            selected_tasks=self.selected_tasks,
-        )
-        self.tasks = self.current_adapter.tasks
+        try:
+            self.current_adapter = ModelRegistry.create(
+                model_path=model_path,
+                tasks=self.all_tasks,
+                device=self.device,
+                extra=None,
+                selected_tasks=self.selected_tasks,
+            )
+        except Exception as e:
+            self.current_adapter = None
+            self.error.emit(f"Impossible de créer l'adapter du modèle: {e}")
+            return
+
+        self.tasks = getattr(self.current_adapter, "tasks", {}) or {}
         self.tasks_order = list(self.tasks.keys())
+        if not self.tasks_order:
+            self.error.emit("Le modèle n'a aucune tâche exploitable.")
+            return
 
         self.tasksLoaded.emit(self.tasks, self.tasks_order)
 
@@ -1048,17 +1134,11 @@ class SessionManager(QObject):
         if not ok and backend != "auto":
             ok = self._open_camera_backend("auto", None)
         if not ok:
-            raise RuntimeError("Impossible d’ouvrir une source vidéo (GStreamer/rpicam-vid/V4L2).")
+            self.error.emit("Impossible d’ouvrir une source vidéo (GStreamer/rpicam-vid/V4L2).")
+            return
 
         # Thread inference
-        self.stop_infer_thread()
-        self.infer_thread = QThread()
-        self.infer_worker = InferWorker(self.current_adapter)
-        self.infer_worker.moveToThread(self.infer_thread)
-        self.infer_thread.started.connect(self.infer_worker.run)
-        self.infer_worker.resultReady.connect(self._on_infer_result)
-        self.infer_worker.error.connect(lambda msg: self.error.emit(f"Infer error: {msg}"))
-        self.infer_thread.start()
+        self._start_infer_thread()
 
         # Session meta
         self.summary_rows.clear()
@@ -1067,27 +1147,72 @@ class SessionManager(QObject):
             "model_path": model_path,
             "tasks": self.tasks_order.copy(),
             "start_time": self.session_started_at.isoformat(timespec="seconds"),
+            "camera_backend": str(self.cap_backend),
         }
-        self.lat_ema_s = None
-        self.fps_hist.clear()
-        self._tick = 0
-        self._read_fail = 0
+
+        with self._lock:
+            self.last_items = []
+            self.lat_ema_s = None
+            self.fps_hist.clear()
+            self.last_speed_text = ""
+            self._tick = 0
+            self._read_fail = 0
+
+        self.info.emit("Session démarrée.")
+
+    def _start_infer_thread(self):
+        self.stop_infer_thread()
+
+        if self.current_adapter is None:
+            return
+
+        self.infer_thread = QThread()
+        self.infer_worker = InferWorker(self.current_adapter)
+        self.infer_worker.moveToThread(self.infer_thread)
+
+        self.infer_thread.started.connect(self.infer_worker.run)
+        self.infer_worker.resultReady.connect(self._on_infer_result)
+        self.infer_worker.error.connect(lambda msg: self.error.emit(f"Infer error: {msg}"))
+
+        # Garantit stop si thread se termine
+        self.infer_thread.finished.connect(lambda: self.info.emit("Thread inference terminé."))
+
+        self.infer_thread.start()
 
     def stop_session(self):
+        # Arrêt dans l'ordre : worker -> caméra -> recording -> export
         self.stop_infer_thread()
         self._release_camera()
         self.stop_recording()
 
         if self.session_started_at is not None:
-            self.write_summary_file()
+            try:
+                self.write_summary_file()
+            except Exception as e:
+                self.error.emit(f"Erreur export: {e}")
             self.session_started_at = None
 
+        self.info.emit("Session arrêtée.")
+
     def stop_infer_thread(self):
-        if self.infer_worker:
-            self.infer_worker.stop()
-        if self.infer_thread:
-            self.infer_thread.quit()
-            self.infer_thread.wait()
+        # Idempotent
+        if self.infer_worker is not None:
+            try:
+                self.infer_worker.stop()
+            except Exception:
+                pass
+
+        if self.infer_thread is not None:
+            try:
+                self.infer_thread.requestInterruption()
+            except Exception:
+                pass
+            try:
+                self.infer_thread.quit()
+                self.infer_thread.wait(1200)
+            except Exception:
+                pass
+
         self.infer_worker = None
         self.infer_thread = None
 
@@ -1098,7 +1223,15 @@ class SessionManager(QObject):
         Un tick = lit une frame, soumet au worker (1/N), applique overlay, renvoie QPixmap.
         target_qsize : QSize du QLabel (ou widget) pour scaler côté Qt.
         """
+        # pacing (évite que l’UI appelle 200 FPS si timer mal réglé)
         now = time.time()
+        if self.target_fps and self.target_fps > 0:
+            min_dt = 1.0 / float(self.target_fps)
+            if (now - self._last_tick_t) < (0.65 * min_dt):
+                return
+        self._last_tick_t = now
+
+        # FPS affichage (EMA)
         dt = max(1e-6, now - self._last_disp_t)
         self._last_disp_t = now
         fps_disp = 1.0 / dt
@@ -1109,98 +1242,137 @@ class SessionManager(QObject):
         frame = None
         ok = False
 
-        if self.cap_backend == "lc-mjpeg" and self.lc_mjpeg is not None:
-            ok, frame = self.lc_mjpeg.read()
-        elif self.cap is not None:
-            ok, frame = self.cap.read()
+        try:
+            if self.cap_backend == "lc-mjpeg" and self.lc_mjpeg is not None:
+                ok, frame = self.lc_mjpeg.read()
+            elif self.cap is not None:
+                ok, frame = self.cap.read()
+        except Exception as e:
+            ok, frame = False, None
+            self.error.emit(f"Erreur lecture caméra: {e}")
 
         if not ok or frame is None:
             self._read_fail += 1
             if self._read_fail >= 60:
-                # reopen
-                self._open_camera_backend("auto", None)
+                self.info.emit("Lecture caméra instable → tentative de réouverture.")
+                self._reopen_camera_safely()
                 self._read_fail = 0
             return
 
         self._read_fail = 0
 
-        # Submit to inference worker 1/N
+        # Submit to inference worker 1/N (copie pour éviter data-race OpenCV)
         if self.infer_worker and (self._tick % max(1, int(self.infer_stride)) == 0):
-            self.infer_worker.submit(frame)
+            try:
+                # drop si backlog (si le worker expose une API optionnelle)
+                if hasattr(self.infer_worker, "queue_size") and callable(getattr(self.infer_worker, "queue_size")):
+                    if self.infer_worker.queue_size() >= 2:
+                        pass
+                    else:
+                        self.infer_worker.submit(frame.copy())
+                else:
+                    self.infer_worker.submit(frame.copy())
+            except Exception as e:
+                self.error.emit(f"Submit inference failed: {e}")
 
         # Overlay
-        disp = frame.copy()
-        if self.last_items:
-            disp = draw_predictions_panel(disp, self.last_items, location="tr")
+        disp = frame  # pas besoin de copy si on ne modifie pas frame ; on va dessiner → copy
+        try:
+            disp = frame.copy()
+            with self._lock:
+                items = list(self.last_items)
+                speed_txt = self.last_speed_text
 
-        if self.show_speed:
-            speed_txt = self.last_speed_text or ""
-            disp_txt = f"{self._disp_fps_ema:.1f} FPS affichage"
-            if speed_txt:
-                disp_txt = speed_txt + f"  |  {disp_txt}"
-            disp = draw_bottom_right(disp, disp_txt, alpha=0.55)
+            if items:
+                disp = draw_predictions_panel(disp, items, location="tr")
 
-        # Recording
-        if self.recording_video:
-            self._record_frame(disp)
+            if self.show_speed:
+                disp_txt = f"{self._disp_fps_ema:.1f} FPS affichage"
+                if speed_txt:
+                    disp_txt = speed_txt + f"  |  {disp_txt}"
+                disp = draw_bottom_right(disp, disp_txt, alpha=0.55)
 
-        # Convert to pixmap and emit
-        pix = bgr_to_qpixmap_scaled(disp, target_qsize, fast=fast_scale)
-        self.frameReady.emit(pix)
+            # Recording
+            if self.recording_video:
+                self._record_frame(disp)
+
+            # Convert to pixmap and emit
+            pix = bgr_to_qpixmap_scaled(disp, target_qsize, fast=fast_scale)
+            self.frameReady.emit(pix)
+
+        except Exception as e:
+            self.error.emit(f"Erreur overlay/affichage: {e}")
 
     # ───────────────────────── Inference result ─────────────────────────
 
     @Slot(dict, float)
     def _on_infer_result(self, outputs: dict, elapsed: float):
-        items = []
-        per_task = {}
+        try:
+            items: List[Tuple[str, str, float]] = []
+            per_task: Dict[str, Dict[str, Any]] = {}
 
-        for task in self.tasks_order:
-            if task not in outputs:
-                continue
-            logits = outputs[task]
-            logits_np = logits.detach().cpu().numpy() if hasattr(logits, "detach") else np.asarray(logits)
-            vec = logits_np[0] if logits_np.ndim > 1 else logits_np
+            for task in self.tasks_order:
+                if task not in outputs:
+                    continue
 
-            probs = softmax_np(vec)
-            idx = int(np.argmax(probs))
-            score = float(probs[idx])
+                logits = outputs[task]
+                logits_np = logits.detach().cpu().numpy() if hasattr(logits, "detach") else np.asarray(logits)
+                vec = logits_np[0] if logits_np.ndim > 1 else logits_np
 
-            labels = self.tasks.get(task, [f"{task}_{i}" for i in range(len(probs))])
-            label = labels[idx] if (idx < len(labels) and score >= float(self.prob_threshold)) else "Unknown"
+                probs = softmax_np(vec)
+                idx = int(np.argmax(probs))
+                score = float(probs[idx])
 
-            items.append((task, label, score))
-            per_task[task] = {"label": label, "score": score}
+                labels = self.tasks.get(task, [f"{task}_{i}" for i in range(len(probs))])
+                label = labels[idx] if (idx < len(labels) and score >= float(self.prob_threshold)) else "Unknown"
 
-        self.last_items = items
+                items.append((task, label, score))
+                per_task[task] = {"label": label, "score": score}
 
-        self.lat_ema_s = elapsed if self.lat_ema_s is None else (0.2 * elapsed + 0.8 * self.lat_ema_s)
-        inst_fps = 1.0 / max(elapsed, 1e-6)
-        self.fps_hist.append(inst_fps)
-        avg_fps = sum(self.fps_hist) / len(self.fps_hist)
-        self.last_speed_text = f"{self.lat_ema_s * 1000:.0f} ms IA  |  {avg_fps:.1f} FPS IA"
-        self.speedText.emit(self.last_speed_text)
+            # Update shared state
+            with self._lock:
+                self.last_items = items
 
-        # Summary row
-        now = datetime.datetime.now()
-        ts_ms = int(now.timestamp() * 1000)
-        row = {
-            "timestamp_ms": ts_ms,
-            "iso_time": now.isoformat(timespec="milliseconds"),
-            "latency_s": round(elapsed, 4),
-            "camera": str(self.cap_backend),
-            "model": Path(self.meta.get("model_path", "")).name,
-        }
-        for t, info in per_task.items():
-            row[f"{t}_label"] = info["label"]
-            row[f"{t}_score"] = round(float(info["score"]), 4)
+                self.lat_ema_s = elapsed if self.lat_ema_s is None else (0.2 * elapsed + 0.8 * self.lat_ema_s)
+                inst_fps = 1.0 / max(elapsed, 1e-6)
+                self.fps_hist.append(inst_fps)
+                avg_fps = sum(self.fps_hist) / max(1, len(self.fps_hist))
+                self.last_speed_text = f"{self.lat_ema_s * 1000:.0f} ms IA  |  {avg_fps:.1f} FPS IA"
+                speed_txt = self.last_speed_text
 
-        self.summary_rows.append(row)
+            self.speedText.emit(speed_txt)
+
+            # Summary row
+            now = datetime.datetime.now()
+            ts_ms = int(now.timestamp() * 1000)
+
+            model_name = ""
+            try:
+                model_name = Path(self.meta.get("model_path", "")).name
+            except Exception:
+                model_name = str(self.meta.get("model_path", ""))
+
+            row = {
+                "timestamp_ms": ts_ms,
+                "iso_time": now.isoformat(timespec="milliseconds"),
+                "latency_s": round(float(elapsed), 4),
+                "camera": str(self.cap_backend),
+                "model": model_name,
+            }
+            for t, info in per_task.items():
+                row[f"{t}_label"] = info["label"]
+                row[f"{t}_score"] = round(float(info["score"]), 4)
+
+            self.summary_rows.append(row)
+
+        except Exception as e:
+            self.error.emit(f"Erreur traitement résultat inference: {e}")
 
     # ───────────────────────── Recording ─────────────────────────
 
     def start_recording(self):
         self.recording_video = True
+        self.info.emit("Recording ON")
 
     def stop_recording(self):
         self.recording_video = False
@@ -1210,60 +1382,93 @@ class SessionManager(QObject):
             except Exception:
                 pass
             self.video_writer = None
+        self.info.emit("Recording OFF")
 
     def _record_frame(self, disp_bgr: np.ndarray):
-        h, w = disp_bgr.shape[:2]
-        if self.video_writer is None:
-            name = self.session_name or self._build_default_session_name(self.meta.get("model_path", "session"))
-            out_path = self.output_dir / f"{name}.avi"
-            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-            self.video_writer = cv2.VideoWriter(str(out_path), fourcc, float(self.target_fps), (w, h))
-        if self.video_writer:
-            self.video_writer.write(disp_bgr)
+        try:
+            h, w = disp_bgr.shape[:2]
+            if self.video_writer is None:
+                base = self._resolve_session_base_name(self.meta.get("model_path", "session"))
+                out_path = self.output_dir / f"{base}.avi"
+                fourcc = cv2.VideoWriter_fourcc(*"XVID")
+                self.video_writer = cv2.VideoWriter(str(out_path), fourcc, float(self.target_fps or 20), (w, h))
+            if self.video_writer:
+                self.video_writer.write(disp_bgr)
+        except Exception as e:
+            self.error.emit(f"Erreur recording: {e}")
+            self.stop_recording()
 
     def _build_default_session_name(self, model_path: str) -> str:
-        base = Path(model_path).stem
+        base = Path(model_path).stem if model_path else "session"
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{base}_{ts}"
+
+    def _resolve_session_base_name(self, model_path: str) -> str:
+        """
+        Renvoie le nom de session réellement utilisé (et le mémorise).
+        - Si self.session_name est fixé : on le respecte
+        - Sinon : on génère un nom et on le mémorise pour collect_latest_session_files()
+        """
+        name = (self.session_name or "").strip()
+        if not name:
+            # si déjà calculé pour cette session, réutilise
+            if self._last_session_base_name:
+                return self._last_session_base_name
+            name = self._build_default_session_name(model_path)
+        self._last_session_base_name = name
+        return name
 
     # ───────────────────────── Export ─────────────────────────
 
     def write_summary_file(self):
         end_time = datetime.datetime.now()
+
+        # start_time robuste
+        start_iso = self.meta.get("start_time")
+        if start_iso:
+            try:
+                start_dt = datetime.datetime.fromisoformat(start_iso)
+            except Exception:
+                start_dt = self.session_started_at or end_time
+        else:
+            start_dt = self.session_started_at or end_time
+            self.meta["start_time"] = start_dt.isoformat(timespec="seconds")
+
         self.meta["end_time"] = end_time.isoformat(timespec="seconds")
-        start_dt = datetime.datetime.fromisoformat(self.meta["start_time"])
         self.meta["duration_s"] = (end_time - start_dt).total_seconds()
 
-        name = self.session_name or self._build_default_session_name(self.meta.get("model_path", "session"))
-        fmt = self.export_format
-        base = self.output_dir / f"{name}"
+        base = self._resolve_session_base_name(self.meta.get("model_path", "session"))
+        fmt = (self.export_format or "json").strip().lower()
+        out_base = self.output_dir / f"{base}"
 
-        meta_path = base.with_suffix(".meta.json")
+        # meta
+        meta_path = out_base.with_suffix(".meta.json")
         meta_obj = {"meta": self.meta, "summary_count": len(self.summary_rows)}
         meta_path.write_text(json.dumps(meta_obj, indent=2), encoding="utf-8")
 
+        # frames
         if fmt == "json":
             out = {"meta": self.meta, "frames": self.summary_rows}
-            base.with_suffix(".json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+            out_base.with_suffix(".json").write_text(json.dumps(out, indent=2), encoding="utf-8")
 
         elif fmt == "csv":
             if pd is not None:
-                pd.DataFrame(self.summary_rows).to_csv(base.with_suffix(".csv"), index=False)
+                pd.DataFrame(self.summary_rows).to_csv(out_base.with_suffix(".csv"), index=False)
             else:
-                write_csv_fallback(base.with_suffix(".csv"), self.summary_rows)
+                write_csv_fallback(out_base.with_suffix(".csv"), self.summary_rows)
 
         elif fmt == "xlsx":
             if pd is not None:
                 df = pd.DataFrame(self.summary_rows)
                 try:
-                    df.to_excel(base.with_suffix(".xlsx"), index=False)
+                    df.to_excel(out_base.with_suffix(".xlsx"), index=False)
                 except Exception:
-                    df.to_csv(base.with_suffix(".csv"), index=False)
+                    df.to_csv(out_base.with_suffix(".csv"), index=False)
             else:
-                write_csv_fallback(base.with_suffix(".csv"), self.summary_rows)
+                write_csv_fallback(out_base.with_suffix(".csv"), self.summary_rows)
 
         elif fmt == "txt":
-            with open(base.with_suffix(".txt"), "w", encoding="utf-8") as f:
+            with open(out_base.with_suffix(".txt"), "w", encoding="utf-8") as f:
                 f.write("# META\n")
                 for k, v in self.meta.items():
                     f.write(f"{k}: {v}\n")
@@ -1273,6 +1478,13 @@ class SessionManager(QObject):
                     f.write("\t".join(keys) + "\n")
                     for r in self.summary_rows:
                         f.write("\t".join(str(r.get(k, "")) for k in keys) + "\n")
+
+        else:
+            # fallback
+            out = {"meta": self.meta, "frames": self.summary_rows}
+            out_base.with_suffix(".json").write_text(json.dumps(out, indent=2), encoding="utf-8")
+
+        self.info.emit(f"Export écrit: {out_base.name}.*")
 
     # ───────────────────────── Convenience core utilities ─────────────────────────
 
@@ -1289,20 +1501,28 @@ class SessionManager(QObject):
         return ok_count
 
     def collect_latest_session_files(self) -> List[Path]:
-        base = self.session_name
+        """
+        Retourne les fichiers du dernier export (meta + summary + video).
+        Fiable même si session_name était vide (grâce à _last_session_base_name).
+        """
+        base = (self.session_name or "").strip() or (self._last_session_base_name or "").strip()
         if not base:
             return []
+
         outs: List[Path] = []
         meta = self.output_dir / f"{base}.meta.json"
         if meta.exists():
             outs.append(meta)
 
-        ext = self.export_format
-        path = self.output_dir / f"{base}.{'xlsx' if ext == 'xlsx' else ext}"
-        if not path.exists() and ext == "xlsx":
-            alt = self.output_dir / f"{base}.csv"
-            if alt.exists():
-                path = alt
+        ext = (self.export_format or "json").strip().lower()
+        if ext == "xlsx":
+            path = self.output_dir / f"{base}.xlsx"
+            if not path.exists():
+                alt = self.output_dir / f"{base}.csv"
+                if alt.exists():
+                    path = alt
+        else:
+            path = self.output_dir / f"{base}.{ext}"
         if path.exists():
             outs.append(path)
 
@@ -1311,3 +1531,4 @@ class SessionManager(QObject):
             outs.append(vid)
 
         return outs
+
